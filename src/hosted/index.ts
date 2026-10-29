@@ -52,7 +52,7 @@ export interface Hosted {
 export function loadHosted(): Hosted | null {
   const clientId = envValue("SEO_MCP_HOSTED_CLIENT_ID"), clientSecret = envValue("SEO_MCP_HOSTED_CLIENT_SECRET");
   const secret = envValue("SEO_MCP_HOSTED_SECRET"), publicUrlRaw = envValue("SEO_MCP_PUBLIC_URL");
-  if (!clientId && !clientSecret && !secret && !publicUrlRaw) return null;
+  if (!clientId && !clientSecret && !secret) return null; // PUBLIC_URL also configures private HTTP/OAuth deployments.
   const missing = [["SEO_MCP_HOSTED_CLIENT_ID", clientId], ["SEO_MCP_HOSTED_CLIENT_SECRET", clientSecret], ["SEO_MCP_HOSTED_SECRET", secret], ["SEO_MCP_PUBLIC_URL", publicUrlRaw]].filter(([, v]) => !v).map(([k]) => k);
   if (missing.length) throw new Error(`Hosted mode is partially configured; missing ${missing.join(", ")}`);
   const publicUrl = publicUrlRaw!.replace(/\/+$/, "");

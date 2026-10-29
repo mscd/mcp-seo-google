@@ -400,6 +400,12 @@ Needs WP-CLI on the host and passwordless SSH from the machine running the serve
 
 ## Running as a 24/7 HTTP server
 
+HTTP mode requires `MCP_AUTH_TOKEN`, including loopback and hosted deployments; missing tokens stop startup. Behind a reverse proxy, set `SEO_MCP_PUBLIC_URL=https://your-mcp-host` so the server accepts that exact Host and browser Origin. Additional exact hosts (including nondefault ports) and browser origins can be configured with comma-separated `MCP_ALLOWED_HOSTS` and `MCP_ALLOWED_ORIGINS`. Keep these lists narrow. The proxy must preserve the public Host header. Stdio mode needs no token.
+
+Web, crawl, sitemap and image requests accept only public HTTP(S) destinations, validate redirects, cap each response at 20 MiB and enforce a deadline through body consumption. Internal/private-site audits are intentionally blocked, including in read-only mode. Public DNS resolution must be available to the application; failed lookups reject requests rather than silently skipping address validation. When using an outbound HTTP proxy, configure that proxy to block private/link-local destinations and DNS rebinding too: it performs its own DNS resolution. Existing proxy settings and TLS verification are preserved.
+
+After upgrading an existing WordPress integration, reapply a post's current JSON-LD with `wp_set_schema` on each connected site. This upgrades the previously generated `seo-mcp-schema.php` mu-plugin to escape script-sensitive characters at render time, including older stored JSON-LD. Rebuilding this server alone cannot update plugin files on remote sites. The tool refuses to overwrite a plugin it does not recognize as managed by this project.
+
 ```bash
 MCP_TRANSPORT=http MCP_AUTH_TOKEN=$(openssl rand -hex 32) node dist/index.js --http
 curl http://127.0.0.1:8080/healthz

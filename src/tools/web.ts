@@ -3,6 +3,7 @@
  * page_audit, pagespeed, sitemap_check, robots_check.
  */
 import { gunzipSync } from "node:zlib";
+import { safeFetch } from "../safeFetch.js";
 import { envValue } from "../env.js";
 import { z } from "zod";
 import * as cheerio from "cheerio";
@@ -17,13 +18,7 @@ import { heartbeat, round, tool } from "../util.js";
 const UA = "Mozilla/5.0 (compatible; google-seo-mcp/0.1; +https://github.com/Akxan/google-seo-mcp)";
 
 export async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = 20_000): Promise<Response> {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal: ctrl.signal, headers: { "User-Agent": UA, Accept: "*/*", ...(init.headers ?? {}) } });
-  } finally {
-    clearTimeout(t);
-  }
+  return safeFetch(url, { ...init, headers: { "User-Agent": UA, Accept: "*/*", ...(init.headers ?? {}) } }, timeoutMs);
 }
 
 /** Follow redirects manually so the chain can be reported. */
@@ -58,7 +53,7 @@ export async function collectSitemapUrls(sitemapUrl: string, opts: { maxSitemaps
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       let body: string;
       const buf = Buffer.from(await res.arrayBuffer());
-      body = u.endsWith(".gz") || res.headers.get("content-type")?.includes("gzip") ? gunzipSync(buf).toString("utf8") : buf.toString("utf8");
+      body = u.endsWith(".gz") || res.headers.get("content-type")?.includes("gzip") ? gunzipSync(buf, { maxOutputLength: 20 * 1024 * 1024 }).toString("utf8") : buf.toString("utf8");
       if (/<sitemapindex/i.test(body)) {
         const children = [...body.matchAll(/<sitemap>[\s\S]*?<loc>\s*([^<\s]+)\s*<\/loc>/gi)].map((m) => decodeXml(m[1]));
         sitemaps.push({ url: u, type: "index", count: children.length });

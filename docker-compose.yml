@@ -15,6 +15,7 @@ services:
       MCP_TRANSPORT: http
       MCP_HOST: 0.0.0.0
       MCP_PORT: 8080
+      MCP_ALLOWED_HOSTS: 127.0.0.1:8787,localhost:8787
       GOOGLE_APPLICATION_CREDENTIALS: /secrets/service-account.json
       GMAIL_CREDENTIALS: /secrets/gmail.json          # optional, from `npm run auth -- --gmail`
       SEO_MCP_DATA_DIR: /data                          # hosted-mode database (ignored unless hosted mode is on)

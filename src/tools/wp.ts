@@ -5,6 +5,7 @@
  * WP_SSH_HOST / WP_SSH_PORT / WP_SSH_USER / WP_PATH [/ WP_SSH_KEY].
  */
 import { spawn } from "node:child_process";
+import { currentRequest } from "../google.js";
 import { envValue } from "../env.js";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -237,6 +238,7 @@ function normalizePathLocal(url: string): string {
 
 /** Find the configured WordPress site whose home URL host matches, and return its post index. */
 export async function wpPostIndexForHost(host: string): Promise<{ site: string; byPath: Map<string, { ID: number; title: string }> } | null> {
+  if (currentRequest()) return null; // Hosted requests must never use operator SSH connections.
   const wanted = host.replace(/^www\./, "").toLowerCase();
   for (const site of loadWpSites()) {
     try {

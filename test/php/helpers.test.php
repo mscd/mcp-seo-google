@@ -10,6 +10,28 @@ $checks = 0; $failures = [];
 function check(string $name, bool $ok): void { global $checks, $failures; $checks++; if (!$ok) $failures[] = $name; }
 function throws(callable $fn): bool { try { $fn(); return false; } catch (RuntimeException $e) { return true; } }
 
+// JSON-LD is embedded in HTML: closing tags must never survive encoding.
+$schema = ['description' => '</script><script>alert(1)</script>', 'name' => 'A & "B"'];
+$safe = h_schema_json($schema);
+check('schema encoding cannot close a script element', stripos($safe, '</script') === false && strpos($safe, '<') === false);
+check('schema encoding preserves JSON data', json_decode($safe, true) === $schema);
+
+// Exercise the actual generated plugin with legacy unsafe stored data.
+function add_action($name, $callback, $priority) { $GLOBALS['schema_callback'] = $callback; }
+function is_singular() { return true; }
+function get_queried_object_id() { return 1; }
+function get_post_meta($id, $key, $single) { return $GLOBALS['legacy_schema']; }
+function wp_json_encode($value, $flags) { return json_encode($value, $flags); }
+$GLOBALS['legacy_schema'] = json_encode($schema, JSON_UNESCAPED_SLASHES);
+$plugin = tempnam(sys_get_temp_dir(), 'seo-schema-test-');
+file_put_contents($plugin, "<?php\n/** Plugin Name: SEO MCP Schema; managed by google-seo-mcp */\necho 'unsafe legacy';");
+h_install_schema_plugin($plugin);
+check('existing managed plugin is upgraded', file_get_contents($plugin) === h_schema_plugin_code());
+require $plugin;
+ob_start(); ($GLOBALS['schema_callback'])(); $rendered = ob_get_clean();
+check('legacy JSON-LD renders exactly one inert script', substr_count($rendered, '</script>') === 1 && strpos($rendered, '<script>alert') === false);
+unlink($plugin);
+
 // --- Yoast social profiles: which URLs belong to a named platform ---------------------------
 check('instagram', h_social_platform('https://www.instagram.com/octocat/') === 'instagram');
 check('youtube channel', h_social_platform('https://www.youtube.com/@octocat') === 'youtube');

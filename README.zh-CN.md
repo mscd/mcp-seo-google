@@ -1,5 +1,7 @@
 # Google SEO MCP
 
+安全更新：HTTP 模式（包括本地和托管模式）必须设置 `MCP_AUTH_TOKEN`。反向代理部署还需设置 `SEO_MCP_PUBLIC_URL`，用于校验 Host 和 Origin；额外可信地址分别使用 `MCP_ALLOWED_HOSTS`（含端口）和 `MCP_ALLOWED_ORIGINS`。网页抓取禁止私有/本地地址，每次响应限制为 20 MiB，并对完整响应执行超时；出站代理也必须阻止私有地址和 DNS 重绑定。现有 WordPress 站点升级后，请用 `wp_set_schema` 重新保存一篇文章的原有 JSON-LD，升级远程生成的安全输出插件。
+
 把 **Google Search Console**、**Google Analytics 4**、PageSpeed 与 CrUX、网页与 GEO 审计（结构化数据、llms.txt、AI 爬虫）、
 可选的 WordPress（SSH + WP-CLI）和 GitHub 封装成一个 MCP 服务，让 Claude、Codex、Cursor 等任何 MCP 客户端
 可以直接查询你网站的搜索表现、索引状态和 GA4 流量，并动手修改页面，用于日常 SEO / GEO 运维。
