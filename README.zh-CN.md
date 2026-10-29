@@ -1,0 +1,508 @@
+# Google SEO MCP
+
+把 **Google Search Console**、**Google Analytics 4**、PageSpeed 与 CrUX、网页与 GEO 审计（结构化数据、llms.txt、AI 爬虫）、
+可选的 WordPress（SSH + WP-CLI）和 GitHub 封装成一个 MCP 服务，让 Claude、Codex、Cursor 等任何 MCP 客户端
+可以直接查询你网站的搜索表现、索引状态和 GA4 流量，并动手修改页面，用于日常 SEO / GEO 运维。
+
+支持两种运行方式：
+
+| 方式 | 场景 | 启动命令 |
+|---|---|---|
+| stdio | 本机使用，客户端按需拉起 | `node dist/index.js` |
+| Streamable HTTP | 部署在 Linux 服务器上 24 小时运行 | `node dist/index.js --http` |
+
+## 工具列表
+
+| 工具 | 作用 |
+|---|---|
+| `google_auth_status` | 检查当前使用的 Google 凭据是否有效（排障先跑这个） |
+| `gsc_list_sites` | 列出账号可访问的所有 Search Console 资源 |
+| `gsc_search_analytics` | 搜索表现报告：点击、展示、CTR、排名，可按 query/page/country/device/date 分组并过滤 |
+| `gsc_compare_periods` | 两个时间段对比，按点击变化排序，直接看出涨跌页面/关键词；可按关键词、页面、国家、设备、搜索外观或日期分组，支持 dataState 与 aggregationType |
+| `gsc_inspect_url` | URL 检查：索引状态、抓取时间、规范网址、robots、移动可用性 |
+| `gsc_list_sitemaps` | 列出已提交的站点地图及错误/警告；传 sitemapIndex 可列出索引文件里的子站点地图各自的错误数，定位问题出在哪个子文件 |
+| `gsc_submit_sitemap` | 提交或重新提交站点地图 |
+| `ga_list_properties` | 列出账号可访问的 GA4 媒体资源 |
+| `ga_run_report` | GA4 报告：任意维度/指标、过滤（可一次匹配多值、可用或逻辑）、排序、分页，最多 4 个日期区间；结果附时区、货币，数据被抽样或因隐私阈值抑制时会明确告知 |
+| `ga_run_realtime_report` | GA4 实时（最近 30 分钟）数据，可筛选、排序、按分钟区间切分 |
+| `ga_get_metadata` | 查询某媒体资源可用的维度和指标（含自定义维度），带指标类型（秒/货币/普通）与已废弃的旧名 |
+| `ga_compare_periods` | GA4 两个时间段对比，按维度拆分，含总量和百分比变化 |
+| `ga_landing_page_seo` | 自然搜索落地页：GA4 行为数据与 Search Console 点击数据合并成一张表；GA4 记到的搜索访问远少于 Search Console 点击时发出提醒（多半是同意模式或统计代码缺失，不是流量真少） |
+| `ga_run_pivot_report` | 透视表：一个维度做行、一个做列，例如落地页 × 设备 |
+| `ga_batch_run_reports` | 一次调用跑最多 5 个报表 |
+| `ga_run_funnel_report` | 漏斗：按事件定义步骤，看每步人数与流失，可按维度拆分；可看流失后用户的下一步动作，也可做趋势漏斗 |
+| `ga_check_compatibility` | 检查维度指标组合能否一起查询 |
+| `ga_property_config` | 只读配置：时区货币、数据保留、数据流与增强型衡量、自定义维度指标、关键事件、Google Ads 关联、受众（含定义条件）、归因模型与回溯窗口、Google Signals 状态 |
+| `ga_create_custom_dimension` | 把事件参数（或用户属性）注册成自定义维度：GA4 只保留已注册参数的值，且不补历史；一次可注册多个，已有的跳过；维度不能删只能归档，所以先看 `ga_property_config`；支持 dryRun。只读模式下不注册 |
+| `ga_create_key_event` | 把事件标成关键事件（转化）：GA4 后台只能给「近期事件」里出现过的事件点星，新埋的点要等流量，API 立刻就能标；可选每次事件或每会话计数一次，已标的跳过，上限 30 个；支持 dryRun。只读模式下不注册 |
+| `gsc_delete_sitemap` / `gsc_add_site` / `gsc_delete_site` | 站点地图删除、资源添加与移除 |
+| `gsc_opportunities` | 展示高但排名在 8 到 20 位的关键词与页面，自动映射到 WordPress 文章 ID |
+| `gsc_cannibalization` | 同一关键词被多个页面分摊的情况 |
+| `gsc_index_coverage` | 批量 URL 检查，汇总索引状态；另给出收录该页的站点地图、引荐链接、带严重级别的富媒体结果问题，以及孤立页标记 |
+| `page_audit` | 抓取任意 URL：title、描述、canonical、robots、标题结构、缺 alt 图片、内外链、字数、结构化数据、问题清单 |
+| `pagespeed` | PageSpeed Insights：性能与 SEO 得分、Core Web Vitals 实验室与真实用户数据、优化建议（需 `PAGESPEED_API_KEY`） |
+| `sitemap_check` | 拉取站点地图（支持索引与 gz），抽样或全量检查状态码 |
+| `robots_check` | 解析 robots.txt，判断 URL 对指定 UA 是否可抓取 |
+| `canonical_host_check` | 检查 http/https、带不带 www、结尾斜杠等写法是否都 301 到同一个地址，避免站点被当成两个 |
+| `ai_crawler_access` | 检查 GPTBot、OAI-SearchBot、ClaudeBot、PerplexityBot、Google-Extended 等 AI 爬虫的 robots 规则和真实 UA 请求是否被拦 |
+| `llms_txt_check` / `llms_txt_generate` | 检查 /llms.txt 的存在与格式、链接是否有效；从站点地图生成草稿 |
+| `structured_data_audit` | 提取 JSON-LD，按类型校验必填/推荐字段，核对全站机构实体一致性；并检查实体站得住脚没有：每个 sameAs 档案是否还在（被机器人拒的算 blocked 不算失效）、schema 里的电话在页面上看不看得到、机构有没有一个 @id 供 publisher/author 引用 |
+| `geo_page_score` | 单页 GEO 评分：首段直接回答、问句标题、FAQ、列表表格、可引用数据、作者日期、外部引用、结构化数据 |
+| `geo_answer_coverage` | 逐段读正文：用户真实搜的每个问句，页面上有没有一段在开头就回答它。分 missing（没有）、weak（只是顺带提到，没有对应标题）、buried（答案埋在铺垫后面）、thin（没有可引用的内容）、ok（返回抽出的答案和 FAQPage 草稿）|
+| `eeat_audit` | 站点级 E-E-A-T 清单：关于/联系/隐私页、地址电话、机构 schema、评价 schema、作者页、文章署名与日期 |
+| `gsc_question_queries` | 筛出已有展示的问句关键词，按页面分组并检查页面是否有对应标题和 FAQ schema |
+| `gsc_rich_results_report` | 按搜索外观类型（富媒体、FAQ、评价、视频等）统计点击展示与对应页面 |
+| `indexnow_submit` | 向 Bing/Yandex 推送变更 URL（需 `INDEXNOW_KEY` 及站点根目录密钥文件） |
+| `ai_citation_check` | 用 Perplexity API 问一个问题，看引用来源里有没有你的域名（需 `PERPLEXITY_API_KEY`，付费） |
+| `ai_search_sources` | 一次问最多 10 个问题，只取搜索结果不生成答案（更便宜也更稳定），统计哪些域名被引用、你排第几、哪些问题完全没提到你（需 `PERPLEXITY_API_KEY`） |
+| `schema_generate` / `schema_validate` | 从现有页面生成 FAQPage、BlogPosting、面包屑的 JSON-LD 草稿；发布前校验 |
+| `site_crawl` | 全站爬取审计：状态码、断链、重定向链、重复标题描述、缺 H1、noindex、薄内容、孤立页、入链数、点击深度 |
+| `hreflang_check` | 多语言互引、自引用、x-default、canonical 冲突核对 |
+| `compare_pages` | 与竞品页面并排对比字数、标题结构、schema，并给出内容差距词 |
+| `social_preview_check` | OG 与 Twitter 卡片校验，含图片尺寸与比例 |
+| `keyword_suggest` | Google 联想词扩展，含问句前缀与字母扩展 |
+| `gsc_site_snapshot` | 一次调用给全貌：与上一周期对比的总量、Top 关键词与页面、设备国家分布、涨跌页面、每日曲线；dataState=all 可看到截至昨天的新鲜数据 |
+| `gsc_ctr_opportunities` | 已在首页但点击率低于基准的关键词与页面，估算改标题能多拿的点击 |
+| `seo_digest` | 定期体检：本期与上一周期比,总量、涨跌的页面与关键词、彻底不再带来点击的词,开头先用一句话说明发生了什么;服务端也能按周自动生成并开成 GitHub issue |
+| `migration_check` | 迁移前安全网：把 Search Console 有流量的 URL 和旧站点地图逐个拿到新站测，分类 OK、重定向、跳首页、404 |
+| `cross_site_links` | 两个 Search Console 资源的关键词交叉比对，建议互链并检测是否已链接 |
+| `content_refresh_candidates` | 点击下滑且长期未更新的页面，附丢失的关键词 |
+| `knowledge_graph_check` | Wikidata 与 Google 知识图谱里是否存在该实体（后者需启用 Knowledge Graph Search API） |
+| `crux_history` | Chrome 真实用户 Core Web Vitals 周走势（需启用 Chrome UX Report API） |
+| `crux_snapshot` | 最新一期真实用户数据，含 LCP 四段拆解（服务器响应、资源发现、资源传输、渲染阻塞），直接指出慢在哪一段并给出对应建议 |
+| `wikipedia_pageviews` | 通过 Wikidata 找到某个实体在各语言维基百科的条目，给出逐月浏览量、同比变化与季节性高峰（免费，无需密钥） |
+| `brand_mentions` | 全网品牌提及及是否已链接（需 `BRAVE_API_KEY`，免费额度） |
+| `reviews_snapshot` | Google 商家评分与最新评论（需 `GOOGLE_PLACES_API_KEY`，需开结算） |
+| `github_get_file` / `github_list_dir` / `github_search_code` / `github_list_commits` / `github_build_status` / `github_commit_files` / `github_commit_image` | 读写 GitHub 仓库：一次提交多个文件（整文件、对大文件做局部 find/replace、base64 二进制），从网址取图在服务器上转 webp、裁剪、生成变体后提交；静态站可从任何客户端修改（用 `GITHUB_TOKEN` 或本机 `gh` 登录）；`github_build_status` 查提交后站点是否真的构建成功并上线（检查项、部署记录，或对不回报状态的托管商直接抓页面验证） |
+| `gmail_get_message` | 读取一封邮件的正文（纯文本或 HTML 转文本，支持分页），用于接收别人邮件发来的文章草稿或修改意见 |
+| `oauth_list_grants` / `oauth_revoke_grant` | 查看谁通过 OAuth 连着这台服务(客户端名、权限范围、调用次数、最后一次调用),并一键吊销;只有运营者令牌能看到这两个工具,通过 OAuth 连进来的客户端看不到 |
+| `gmail_find_attachments` / `github_commit_attachment` | 只读搜索已授权的 Gmail 邮箱并列出每封邮件的附件；把邮件里的照片在服务器上转 webp、裁剪、生成变体后直接提交进仓库，全程不经过客户端 |
+
+日期参数支持 `YYYY-MM-DD`、`today`、`yesterday`、`28daysAgo` 这类写法。
+
+## 1. Google Cloud 准备
+
+1. 打开 <https://console.cloud.google.com/> 新建（或选择）一个项目。
+2. 在「API 和服务 → 库」中启用以下三个 API：
+   - **Google Search Console API**
+   - **Google Analytics Data API**
+   - **Google Analytics Admin API**（仅用于 `ga_list_properties`，可选）
+3. 选择一种凭据方式（见下一节）。
+
+## 2. 授权方式
+
+### 方式 A：服务账号（推荐用于服务器 24 小时运行）
+
+1. 「IAM 和管理 → 服务账号」创建一个服务账号，下载 JSON 密钥。
+2. 把服务账号的邮箱（`xxx@yyy.iam.gserviceaccount.com`）添加为：
+   - Search Console 资源的用户（设置 → 用户和权限，「完整」权限才能提交站点地图）；
+   - GA4 媒体资源的用户（管理 → 媒体资源访问权限管理，「查看者」即可；要用 `ga_create_custom_dimension` / `ga_create_key_event` 写入则需要「编辑者」）。
+3. 设置环境变量 `GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json`。
+
+### 方式 B：用自己的 Google 账号 OAuth 授权（本机方便）
+
+> Gmail 附件工具（可选）：在同一项目启用 Gmail API，用桌面应用类型的 OAuth 客户端跑一次 `npm run auth -- --gmail --client-secret ./client_secret.json`，生成 `~/.config/google-seo-mcp/gmail.json`（只读权限），`GMAIL_CREDENTIALS` 指向它。
+
+1. 「API 和服务 → 凭据」创建 **OAuth 客户端 ID**，类型选「桌面应用」，下载 `client_secret.json`。
+   首次使用需要在「OAuth 同意屏幕」把自己的邮箱加为测试用户。
+2. 运行一次：
+   ```bash
+   npm run auth -- --client-secret ./client_secret.json
+   ```
+   浏览器完成授权后，凭据会写到 `~/.config/google-seo-mcp/credentials.json`，服务启动时自动读取。
+3. 如果要放到服务器上，把这个 `credentials.json` 拷过去，并用
+   `GOOGLE_APPLICATION_CREDENTIALS` 指向它即可（无需在服务器上开浏览器）。
+
+凭据查找顺序：`GOOGLE_CREDENTIALS_JSON`（内联 JSON）→ `GOOGLE_APPLICATION_CREDENTIALS`
+→ `~/.config/google-seo-mcp/credentials.json` → gcloud 默认凭据。
+
+## 3. 本机使用
+
+```bash
+npm install
+npm run build
+```
+
+Claude Code：
+
+```bash
+claude mcp add google-seo -- node /绝对路径/Google-SEO-MCP/dist/index.js   # 密钥从项目 .env 读取
+```
+
+Claude Desktop（`claude_desktop_config.json`）：
+
+```json
+{
+  "mcpServers": {
+    "google-seo": {
+      "command": "node",
+      "args": ["/绝对路径/Google-SEO-MCP/dist/index.js"]
+    }
+  }
+}
+```
+
+Codex、Cursor、VS Code、Gemini CLI 的接法见下文「连接客户端」，本机 stdio 同样只需要启动命令。
+
+调试：`npm run inspector` 会打开 MCP Inspector。
+
+## 4. 部署到 Linux 服务器（24 小时运行）
+
+### systemd（推荐）
+
+```bash
+# 服务器上
+sudo useradd -r -s /usr/sbin/nologin seo
+sudo mkdir -p /opt/google-seo-mcp /etc/google-seo-mcp
+sudo rsync -a --exclude node_modules --exclude dist ./ /opt/google-seo-mcp/   # 或 git clone
+cd /opt/google-seo-mcp && sudo npm ci && sudo npm run build
+sudo chown -R seo:seo /opt/google-seo-mcp
+
+# 凭据与环境变量
+sudo cp service-account.json /etc/google-seo-mcp/
+sudo cp deploy/google-seo-mcp.env.example /etc/google-seo-mcp.env
+sudo nano /etc/google-seo-mcp.env        # 填 MCP_AUTH_TOKEN（openssl rand -hex 32）和凭据路径
+sudo chown -R seo:seo /etc/google-seo-mcp /etc/google-seo-mcp.env
+sudo chmod 600 /etc/google-seo-mcp/* /etc/google-seo-mcp.env
+
+# 启动
+sudo cp deploy/google-seo-mcp.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now google-seo-mcp
+sudo systemctl status google-seo-mcp
+curl http://127.0.0.1:8080/healthz
+```
+
+服务默认只监听 `127.0.0.1:8080`。对外访问请用 Caddy 或 Nginx 反向代理并开启 HTTPS，
+示例见 `deploy/Caddyfile.example` 和 `deploy/nginx.conf.example`（Nginx 必须关闭 `proxy_buffering`）。
+`/healthz` 不带令牌时只返回 `{"ok":true}`，带 Bearer 令牌时附带版本号和凭据来源。
+每次调用写入类工具都会往 stderr 写一行审计记录（工具、成败、耗时、客户端、文章 ID 或文件路径这类标识符，不含正文）；设了 `SEO_MCP_DATA_DIR` 时同一行也写进 `<目录>/audit.log`，只保留 30 天（托管模式隐私页承诺的期限），过期的行自动删除。
+`deploy/backup-data.sh <数据目录>` 用来给 cron 备份 `hosted.db` 和 `oauth.db`（保留 14 天，备份后做完整性校验）。别用 `cp`：两个库都是 WAL 模式，最近写入的数据还在 `-wal` 文件里，直接复制 `.db` 可能拿到一个几乎空的库。
+
+### Docker
+
+```bash
+cp service-account.json credentials.json
+echo "MCP_AUTH_TOKEN=$(openssl rand -hex 32)" > .env
+docker compose up -d --build
+```
+
+### 连接客户端（Claude、Codex、Cursor、VS Code、Gemini CLI 或任何 MCP 客户端）
+
+服务走的是标准 MCP 协议，不只给 Claude 用。远程接法对所有客户端都一样：URL 填 `https://mcp.example.com/mcp`，请求头加 `Authorization: Bearer <MCP_AUTH_TOKEN>`。
+
+**Claude Code**
+
+```bash
+claude mcp add --transport http google-seo https://mcp.example.com/mcp \
+  --header "Authorization: Bearer <MCP_AUTH_TOKEN>"
+```
+
+**Claude Desktop / claude.ai / 手机 App**：设置 → 连接器 → 添加自定义连接器，URL 填上面的地址，认证选「无」，在「Request headers」里加 `Authorization: Bearer <MCP_AUTH_TOKEN>`。
+
+**OpenAI Codex**（`~/.codex/config.toml`；令牌从环境变量读，先在 shell 配置里 `export GOOGLE_SEO_MCP_TOKEN=…`）：
+
+```toml
+[mcp_servers.google-seo]
+url = "https://mcp.example.com/mcp"
+bearer_token_env_var = "GOOGLE_SEO_MCP_TOKEN"
+tool_timeout_sec = 600          # pagespeed、site_crawl 会超过 Codex 默认的 60 秒
+
+# 本机 stdio 写法
+# [mcp_servers.google-seo]
+# command = "node"
+# args = ["/绝对路径/Google-SEO-MCP/dist/index.js"]
+```
+
+**Cursor**（`~/.cursor/mcp.json`，或项目内的 `.cursor/mcp.json`）：
+
+```json
+{
+  "mcpServers": {
+    "google-seo": {
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer <MCP_AUTH_TOKEN>" }
+    }
+  }
+}
+```
+
+**VS Code**（Copilot 代理模式；`.vscode/mcp.json` 或用户级 mcp.json）：
+
+```json
+{
+  "servers": {
+    "google-seo": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer <MCP_AUTH_TOKEN>" }
+    }
+  }
+}
+```
+
+**Gemini CLI**（`~/.gemini/settings.json`；`httpUrl` 表示 Streamable HTTP，`timeout` 单位是毫秒）：
+
+```json
+{
+  "mcpServers": {
+    "google-seo": {
+      "httpUrl": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer <MCP_AUTH_TOKEN>" },
+      "timeout": 600000
+    }
+  }
+}
+```
+
+**其他 MCP 客户端**：填同样的 URL 和请求头即可（Streamable HTTP，无状态，每次调用都是一个 POST，没有会话要维持），或者本机用 stdio 启动 `node dist/index.js`。命令行快速验证：
+
+```bash
+curl -s https://mcp.example.com/mcp -H "Authorization: Bearer <MCP_AUTH_TOKEN>" -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+**ChatGPT，以及其他发不了请求头的客户端。** ChatGPT 加 MCP 服务的入口是 `chatgpt.com/plugins` 页右上角的 *+*（先在设置 → 账户安全与登录 → 开发者模式里打开「开发人员模式」）。它的认证下拉只有 *OAuth*、*无身份验证*、*混合* 三项，没有填固定令牌的地方。给服务加上 `SEO_MCP_OAUTH=1`，然后选 *OAuth*，客户端会自己把该知道的都发现出来。
+
+```bash
+SEO_MCP_OAUTH=1     # 需要 MCP_AUTH_TOKEN；在 /mcp 旁边加出下面这些端点
+```
+
+服务自己就成了授权服务器：客户端先自行注册（RFC 7591），再把你送到一个授权页，那一页要你填 `MCP_AUTH_TOKEN` —— 同一个密钥，只是改成在浏览器里输一次，不再随每个请求发送。同意之后签发一个访问令牌（24 小时）和一个轮换的刷新令牌（90 天），两者都只以哈希存进 `<SEO_MCP_DATA_DIR>/oauth.db`。授权页上有个**只读**勾选框，勾上签发的令牌对应的实例不注册任何写入工具，给第三方助手用就该勾它；已经轮换掉的刷新令牌被重放时，整个授权连带作废。端点：`/.well-known/oauth-protected-resource`、`/.well-known/oauth-authorization-server`、`/oauth/register`、`/oauth/authorize`、`/oauth/token`、`/oauth/revoke`，强制 PKCE S256，拒绝 `plain`。你自己的 `MCP_AUTH_TOKEN` 全程照旧当 Bearer 令牌用，不问元数据的客户端也毫无变化。
+
+两点注意：`pagespeed`、`site_crawl`、`gsc_index_coverage` 这类工具会跑几分钟（期间有进度通知），客户端的单工具超时若默认 60 秒要调大；ChatGPT 的开发者模式确实必须打开，不打开的话它会把服务当成深度研究数据源，只找 `search` 和 `fetch` 两个工具。
+
+## 接入任何 agent、SDK 和第三方模型
+
+MCP 是开放标准，这个服务不绑 Claude。会说 MCP 的直接连；不会说 MCP 但模型支持 function calling 的，中间垫一层薄桥接也能连。唯一的硬限制是模型不支持 function calling：那它根本做不了"调工具"这个动作，跟厂家无关。
+
+| 你手上有的 | 怎么接 | 说明 |
+|---|---|---|
+| MCP 客户端：Claude 全家、Codex、Cursor、VS Code、Gemini CLI、Cline、Cherry Studio、n8n、Dify…… | URL 加 `Authorization: Bearer <token>`（见上文「连接客户端」） | `pagespeed`、`site_crawl` 要调大单工具超时 |
+| 自己写的 agent：Claude Agent SDK、OpenAI Agents SDK、LangChain、Google ADK、Vercel AI SDK | SDK 自带的 MCP 客户端，同样的 URL 和请求头 | 示例见下 |
+| 第三方或本地模型：DeepSeek、Qwen、GLM、Kimi、Ollama | 能选模型的 MCP 客户端（Cherry Studio、Cline），或把 SDK 的 `base_url` 指向厂商的 OpenAI 兼容接口 | 模型要支持 function calling；建议给它单独开只读精简实例（见下） |
+| 只能填 URL、不能加请求头的低代码平台 | 只读实例挂在反向代理的一个路径后面，由代理注入请求头 | 主实例的令牌不进任何 URL |
+
+### 从 agent SDK 接
+
+Claude Agent SDK（TypeScript，Python 写法相同）：
+
+```ts
+import { query } from "@anthropic-ai/claude-agent-sdk";
+
+for await (const m of query({
+  prompt: "给我 example.com 最近 28 天的概况，列出排名 8 到 20 名曝光最高的词",
+  options: {
+    mcpServers: {
+      "google-seo": {
+        type: "http",
+        url: "https://mcp.example.com/mcp",
+        headers: { Authorization: `Bearer ${process.env.GOOGLE_SEO_MCP_TOKEN}` },
+      },
+    },
+    allowedTools: ["mcp__google-seo__*"], // 不加这行它看得到工具但不会调用
+  },
+})) {
+  if (m.type === "result" && m.subtype === "success") console.log(m.result);
+}
+```
+
+OpenAI Agents SDK（Python）。同一段代码可以驱动任何 OpenAI 兼容接口，这里以 DeepSeek 为例；用 OpenAI 自己的模型就去掉 `model=` 那行：
+
+```python
+import os
+from agents import Agent, Runner, AsyncOpenAI, OpenAIChatCompletionsModel, set_tracing_disabled
+from agents.mcp import MCPServerStreamableHttp
+
+async def main():
+    async with MCPServerStreamableHttp(
+        name="google-seo",
+        params={"url": "https://mcp.example.com/mcp",
+                "headers": {"Authorization": f"Bearer {os.environ['GOOGLE_SEO_MCP_TOKEN']}"}},
+    ) as seo:
+        set_tracing_disabled(disabled=True)
+        deepseek = AsyncOpenAI(base_url="https://api.deepseek.com", api_key=os.environ["DEEPSEEK_API_KEY"])
+        agent = Agent(
+            name="seo",
+            instructions="先用工具查数据再回答，数字要带时间范围和来源。",
+            model=OpenAIChatCompletionsModel(model="deepseek-v4-flash", openai_client=deepseek),
+            mcp_servers=[seo],
+        )
+        result = await Runner.run(agent, "检查 https://example.com/ 首页 GPTBot 和 PerplexityBot 能不能抓")
+        print(result.final_output)
+```
+
+LangChain（`langchain-mcp-adapters`）、Google ADK（`MCPToolset`）、Vercel AI SDK（`experimental_createMCPClient`）都是同样的 URL 和请求头。
+
+### 第三方模型和本地模型
+
+- 桌面端：Cherry Studio、Cline 可以选 DeepSeek、Qwen、GLM、Kimi 或本地 Ollama 模型，把本服务作为 Streamable HTTP 类型的 MCP 服务器加进去，请求头填 Authorization 即可。
+- 工具定义约 3.7 万 token，每一轮对话都要发；102 个工具对小模型来说太多了。给它们单独开一个只读、精简工具集、单独令牌的实例，模型再糊涂也写不了东西，也看不到用不着的工具：
+
+```yaml
+# docker-compose.yml：在主服务旁边再加一个
+  google-seo-mcp-lite:
+    build: .
+    restart: unless-stopped
+    ports: ["127.0.0.1:8788:8080"]
+    env_file: .env
+    environment:
+      MCP_TRANSPORT: http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8080
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN_LITE}     # 单独一把令牌，写在 .env 里
+      SEO_MCP_READ_ONLY: "1"
+      SEO_MCP_TOOLSETS: gsc,ga4,web,analysis
+      GOOGLE_APPLICATION_CREDENTIALS: /secrets/service-account.json
+    volumes:
+      - ./secrets/service-account.json:/secrets/service-account.json:ro
+```
+
+- 不管接的是谁，工具返回的内容（Search Console 数据、GA4 数据、WordPress 正文）都会发到那家模型的服务器，自己掂量。
+
+### 已知限制
+
+- ChatGPT：它的插件弹窗（2026-09-17 核对）只给 *OAuth*、*无身份验证*、*混合* 三项，填不了固定令牌。服务端设 `SEO_MCP_OAUTH=1` 后选 *OAuth*，见「连接客户端」一节；整条流程由 `test/oauth-http.mjs` 端到端覆盖。
+- 只实现了旧版 HTTP+SSE 传输的客户端：本服务只开了 Streamable HTTP（无状态，每次调用一个 `POST`）。需要 SSE 的话开个 issue。
+- Codex 的自定义模型提供方必须实现 Responses API，所以 Codex 带不动 DeepSeek 这类只有 Chat Completions 接口的厂商；这类模型走 SDK 或 Cherry Studio。
+
+## WordPress 工具（可选）
+
+通过 SSH 在主机上执行 WP-CLI，让 Claude 直接读改 WordPress 内容和 Yoast SEO 字段。
+需要主机装有 WP-CLI，并且本机能免密 SSH 登录。
+
+配置环境变量 `WP_SITES`（JSON 数组，支持多个站）：
+
+```json
+[{"name":"mysite","host":"1.2.3.4","port":22,"user":"ssh_user","path":"domains/example.com/public_html","identityFile":"~/.ssh/id_ed25519"}]
+```
+
+或单站简写：`WP_SSH_HOST`、`WP_SSH_PORT`、`WP_SSH_USER`、`WP_PATH`、`WP_SSH_KEY`。未配置时这组工具不会注册。
+
+| 工具 | 作用 |
+|---|---|
+| `wp_site_info` | WP 版本、站点 URL、固定链接、启用插件、Yoast 分隔符 |
+| `wp_list_posts` | 列文章/页面（ID、标题、slug、状态、URL），支持搜索、按 slug 精确查找、分页 |
+| `wp_get_post` | 读单篇：正文、摘要、URL，以及 Yoast 的 SEO 标题、描述、焦点关键词、canonical、noindex |
+| `wp_update_post` | 改标题、slug、摘要、正文、状态 |
+| `wp_update_seo` | 改 Yoast SEO 字段，改完自动重建 Yoast 索引并清页面缓存 |
+| `wp_get_seo_settings` / `wp_update_seo_settings` | Yoast 全站设置：各类型的标题模板、归档页是否 noindex、面包屑、机构身份（含联系邮箱、电话）与社交主页、站点地图开关（写入默认预演） |
+| `wp_list_revisions` / `wp_update_post_from_revision` | 普通文章的历史版本列表与回滚，回滚前给出逐行差异预览（构建器文章请用 wp_builder_restore） |
+| `wp_delete_cache` | 全站清缓存：页面缓存、关键 CSS 重建、WP Rocket 的「已用 CSS」、对象缓存、Yoast 站点地图缓存（批量改完 SEO、改完页眉页脚或主题后用） |
+| `wp_builder_list_items` | BeTheme（Muffin Builder）站点：列出页面构建器里的标题、正文块、图片等可编辑项，折叠栏、标签页、FAQ 里的每一条也会列出（路径形如 `tabs.2.content`） |
+| `wp_builder_update` | 改构建器项的文本字段（含折叠栏等嵌套条目；只允许在末尾紧接着的下一个编号新增一条，其他不存在的路径一律拒绝），自动重新生成 SEO 副本、重建 Yoast 索引、清缓存；改的是页眉页脚模板时清全站缓存 |
+| `wp_builder_check` | 只读检查构建器数据能否无损往返，并列出可回滚的快照 |
+| `wp_builder_restore` | 回滚构建器内容到写入前的快照（保留最近 3 份，默认预演） |
+| `wp_seo_status` | 全站文章的 Yoast 标题、描述、关键词状态，找出缺失项 |
+| `wp_bulk_update_seo` | 批量写 Yoast SEO 字段 |
+| `wp_list_media` / `wp_update_media` | 媒体库图片及 alt 文本的读写，可只列缺 alt 的 |
+| `wp_upload_media` | 从网址取图，在服务器上转换缩放后入媒体库，写 alt，可直接设为文章特色图 |
+| `wp_list_terms` / `wp_update_term` | 分类、标签及其 Yoast SEO 字段的读写 |
+| `wp_internal_link_suggestions` | 按关键词找出应该链向目标文章的其他文章 |
+| `wp_list_redirects` / `wp_add_redirect` / `wp_delete_redirect` | Yoast Premium 重定向管理 |
+| `wp_set_schema` / `wp_get_schema` | 把 JSON-LD 发布到某篇文章的 head（首次使用自动安装一个 mu-plugin） |
+| `wp_run` | 执行任意 WP-CLI 命令 |
+
+构建器工具依赖 `scripts/mfn-builder.php`，其余批量与 Yoast 操作依赖 `scripts/wp-helper.php`，首次使用时会自动上传到主机的 `~/.google-seo-mcp/`。
+缓存清理支持 WP Rocket、WP Super Cache、W3 Total Cache、LiteSpeed。
+
+## 运行模式
+
+- **只读模式**：`--read-only` 或 `SEO_MCP_READ_ONLY=1`，所有写入类工具不注册。
+### 提示词（斜杠命令）
+
+服务器注册了 6 个现成的工作流。在 Claude 里打斜杠就能选，模型会照着写好的步骤依次调用工具，不用靠它自己判断该用哪个。
+
+| 命令 | 做什么 |
+|---|---|
+| `/traffic_drop` | 流量下跌排查：先看整体形状，再定位具体页面与关键词，然后分别验证是排名、收录还是技术问题 |
+| `/quick_wins` | 找性价比最高的改动：排名在门口的词加上排得好却没人点的词，合并成一份排序清单 |
+| `/publish_check` | 发布前后检查一个网址：页面 SEO、结构化数据、分享卡片、AI 引用就绪度 |
+| `/site_health` | 全站技术体检：域名规范化、爬取、站点地图、robots、hreflang、真实用户性能、AI 爬虫可达性 |
+| `/monthly_report` | 月度报告：Search Console 与 GA4 合并，写成给人看的结论而不是数据堆 |
+| `/index_bloat` | 找索引膨胀：作者页、日期归档、标签页这类不该被收录的薄页面 |
+
+提示词会跟随工具集裁剪：用 `?toolsets=gsc,ga4` 连接时只显示那 4 个跑得通的，不会给出跑不了的命令。
+
+客户端支持情况（2026-09-17 实测）：**Claude Code 终端版可用**，命令形如 `/google-seo:monthly_report`，输入片段即可筛选；**Claude Code 的 VS Code 扩展不支持**把 MCP 提示词做成斜杠命令（官方 issue 已标记为不计划支持）；桌面 App 是否支持没有官方文档。所有参数都设成可选，因为部分客户端会列出提示词却从不向用户索要参数，缺参数时正文会让模型自己查或问你，而不是直接报错。
+
+- **工具集筛选**：`--toolsets=gsc,ga4,web` 或 `SEO_MCP_TOOLSETS`，可选 `gsc`、`ga4`、`web`、`geo`、`analysis`、`wordpress`、`github`、`gmail`。102 个工具的定义约 3.7 万 token，每次对话都会完整加载，只用部分功能时应当裁剪。
+- **按连接裁剪（HTTP 模式）**：在 URL 后面加 `?toolsets=...` 就能让某一个客户端只加载它需要的工具，服务端不用改配置，也不影响其他客户端。加 `?readOnly=1` 可以让这个入口完全不能写。两个参数**只能收窄权限**：请求不到实例本身没开的工具集，也无法把只读实例变成可写。工具集名字拼错会直接返回 400，而不是静默给你一个空服务器。
+
+  | 连接 URL | 工具数 | 约耗 token |
+  |---|---|---|
+  | `/mcp` | 96 | 35500 |
+  | `/mcp?toolsets=gsc,ga4,web,geo,analysis` | 58 | 21000 |
+  | `/mcp?toolsets=gsc,ga4` | 28 | 11700 |
+  | `/mcp?toolsets=web,geo,github,gmail` | 34 | 11000 |
+
+  建议把日常分析用的连接器指向裁剪过的地址，需要改站点时再用完整地址。
+- 每个工具都带 `readOnlyHint` / `destructiveHint` 注解，服务器在初始化时返回 instructions 说明用法与安全约定。
+- `npm test` 运行单元测试、冒烟测试（含工具清单快照，`UPDATE_SNAPSHOT=1 npm test` 刷新）和 README 计数校验。
+- 所有写入类工具和 `github_commit_*` 支持 `dryRun: true`，只返回当前值与将要做的改动，不落地。
+- 单次返回超过 `SEO_MCP_MAX_RESULT_CHARS`（默认 12 万字符）时自动截断数组并提示如何缩小范围。
+
+## 托管模式：让别人用 Google 登录使用
+
+同一个程序可以变成一个小型多用户服务：首页、「用 Google 登录」、以及每个用户自己创建 `/mcp` 令牌的控制台。用户授权的是**只读**的 Search Console 与 GA4 权限；刷新令牌用 AES-256-GCM 加密后存在 SQLite 文件里（Node 自带的 `node:sqlite`，不加依赖）。带 `seo_…` 令牌的 `/mcp` 请求会用该用户自己的 Google 账号执行，服务实例是只读的，只有 `gsc`、`ga4`、`web`、`geo`、`analysis` 工具集（写入类、需要 SSH/GitHub/Gmail 密钥的、以及会花运营者付费额度的工具都不注册）。你自己的 `MCP_AUTH_TOKEN` 不受影响，仍是完整工具集。
+
+1. 在 Google Cloud 建一个类型为 **Web 应用** 的 OAuth 客户端，已授权重定向 URI 填 `https://mcp.example.com/oauth/callback`；启用 Search Console 与 Analytics Data/Admin API；同意屏幕加上 `webmasters.readonly` 和 `analytics.readonly` 两个范围。同意屏幕未经验证时 Google 会显示警告且最多 100 个用户登录，面向公众需要通过 [Google 的 OAuth 验证](https://support.google.com/cloud/answer/13463073)。
+2. 四个变量一起设置（`.env`）：`SEO_MCP_HOSTED_CLIENT_ID`、`SEO_MCP_HOSTED_CLIENT_SECRET`、`SEO_MCP_HOSTED_SECRET`（`openssl rand -hex 32`）、`SEO_MCP_PUBLIC_URL`。可选：`SEO_MCP_DATA_DIR`（数据库位置，Docker 镜像用 `/data`，由 `./data` 挂载）、`SEO_MCP_HOSTED_CONTACT`（隐私页上的联系方式）、Google 验证通过后设 `SEO_MCP_HOSTED_VERIFIED=1`。
+3. 重启。`/` 是首页（中英文），`/login` 开始 Google 授权，`/dashboard` 管理令牌（每人最多 10 个，只显示一次，可撤销），`/privacy` 与 `/terms` 是 Google 验证要求的法律页面，「断开 Google 账号」会撤销 Google 授权并删除该用户的记录和全部令牌。
+
+**托管用户的 GitHub。** 配置了 GitHub App（`SEO_MCP_GITHUB_APP_ID`、`_SLUG`、`_CLIENT_ID`、`_CLIENT_SECRET`、`_PRIVATE_KEY_FILE`；应用需要 *Contents: read & write* 权限、勾选 *Request user authorization (OAuth) during installation*、回调地址 `https://mcp.example.com/connect/github/callback`）后，控制台会出现「连接 GitHub」按钮。用户把应用安装到自己选定的仓库上；服务器核实该安装属于当前登录的 GitHub 用户，只保存安装 ID，工具需要时临时签发一小时有效的安装令牌。之后他的 MCP 令牌就包含 `github_*` 工具，含 `github_commit_files` 与 `github_commit_image`（都支持 `dryRun`），部署在 Cloudflare、Vercel、Netlify 的静态站就能通过他自己的助手编辑。「断开 GitHub」会卸载应用，由它签发的令牌全部失效。运营者的 `GITHUB_TOKEN` 绝不会用于托管请求。
+
+Cookie 为 `HttpOnly`、`SameSite=Lax`，HTTPS 下带 `Secure`；表单带 CSRF 令牌；OAuth 的 `state` 有签名。登录和断开各在 stderr 留一行 JSON（只有用户 ID）。四个变量都不设时这些一概不存在，服务器仍是私有的单用户实例。
+
+## 5. 环境变量
+
+推荐把所有变量写在项目根目录的 `.env`（参考 `.env.example`），服务启动时自动读取，客户端配置里只需要启动命令。也可以在客户端配置的 `env` 里传，已存在的环境变量优先于 `.env`。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MCP_TRANSPORT` | `stdio` | 设为 `http` 等同于 `--http` |
+| `MCP_HOST` | `127.0.0.1` | HTTP 监听地址 |
+| `MCP_PORT` | `8080` | HTTP 端口 |
+| `MCP_PATH` | `/mcp` | HTTP 路径 |
+| `MCP_AUTH_TOKEN` | 无 | Bearer Token；非回环地址监听时务必设置 |
+| `SEO_MCP_OAUTH` | 无 | 设为 `1` 时同时接受 OAuth，给发不了 `Authorization` 头的客户端（ChatGPT）用；需要 `MCP_AUTH_TOKEN`，授权数据存在 `<SEO_MCP_DATA_DIR>/oauth.db` |
+| `SEO_MCP_DIGEST_SITES`（可选 `SEO_MCP_DIGEST_AT`、`SEO_MCP_DIGEST_REPO`） | 无 | HTTP 模式下每周自动对这些 Search Console 资源跑一次 `seo_digest`（默认 UTC 周一 8 点），Markdown 存进 `<SEO_MCP_DATA_DIR>/digests/`；填了仓库就顺便开成 GitHub issue |
+| `GOOGLE_APPLICATION_CREDENTIALS` | 无 | 服务账号或 authorized_user JSON 路径 |
+| `GOOGLE_CREDENTIALS_JSON` | 无 | 直接内联凭据 JSON（适合容器平台的 secret） |
+| `GOOGLE_OAUTH_CLIENT_SECRET_FILE`（或 `--client-secret`）、`GOOGLE_OAUTH_CLIENT_ID` + `GOOGLE_OAUTH_CLIENT_SECRET`、`GOOGLE_OAUTH_PORT` | 端口 `53682` | 只有 `npm run auth` 用：自己账号 OAuth 授权的客户端信息与本机回调端口 |
+| `WP_SITES` | 无 | WordPress 站点 SSH 配置 JSON 数组，见 WordPress 工具一节 |
+| `PAGESPEED_API_KEY` | 无 | PageSpeed Insights API 密钥；不设则用公共匿名配额，经常已耗尽 |
+| `INDEXNOW_KEY` / `INDEXNOW_KEY_LOCATION` | 无 | IndexNow 密钥及密钥文件 URL |
+| `PERPLEXITY_API_KEY` | 无 | Perplexity API 密钥，`ai_citation_check` 与 `ai_search_sources` 需要 |
+| `GOOGLE_API_KEY` / `CRUX_API_KEY` | 无 | 知识图谱与 CrUX 的密钥，未设时复用 `PAGESPEED_API_KEY` |
+| `BRAVE_API_KEY` | 无 | Brave Search，仅 `brand_mentions` |
+| `GOOGLE_PLACES_API_KEY` | 无 | Places API (New)，仅 `reviews_snapshot` |
+| `GITHUB_TOKEN` | 无 | GitHub 工具；未设时尝试 `gh auth token` |
+| `GMAIL_CREDENTIALS` | `~/.config/google-seo-mcp/gmail.json` | `npm run auth -- --gmail` 生成的只读 Gmail 授权文件，附件工具用；服务器上放 `secrets/gmail.json` |
+| `SEO_MCP_READ_ONLY` / `SEO_MCP_TOOLSETS` | 无 | 见运行模式 |
+| `SEO_MCP_HOSTED_CLIENT_ID`、`SEO_MCP_HOSTED_CLIENT_SECRET`、`SEO_MCP_HOSTED_SECRET`、`SEO_MCP_PUBLIC_URL`（可选 `SEO_MCP_DATA_DIR`、`SEO_MCP_HOSTED_CONTACT`、`SEO_MCP_HOSTED_VERIFIED`） | 无 | 托管模式：别人用 Google 登录、各自拿只读令牌，见上一节 |
+| `SEO_MCP_GITHUB_APP_ID`、`SEO_MCP_GITHUB_APP_SLUG`、`SEO_MCP_GITHUB_APP_CLIENT_ID`、`SEO_MCP_GITHUB_APP_CLIENT_SECRET`、`SEO_MCP_GITHUB_APP_PRIVATE_KEY_FILE` | 无 | 托管模式：用户安装到自己仓库上的 GitHub App，让他们的令牌获得 `github_*` 工具（一小时安装令牌） |
+| `SEO_MCP_MAX_RESULT_CHARS` | `120000` | 单次工具结果的字符上限，超出时截断最长的数组并提示如何缩小范围 |
+
+空值一律视为未设置，包括 Docker 从 env 文件原样传入的 `KEY=`。
+
+## 6. 常见问题
+
+- **403 PERMISSION_DENIED**：服务账号邮箱没有被加到 Search Console / GA4 的用户列表，或者 API 未启用。
+- **Search Console 最近两三天没数据**：官方数据有延迟，`dataState: "all"` 可以拿到未最终确认的新鲜数据。
+- **URL 检查配额**：每个资源每天约 2000 次，不要批量扫全站。
+- **OAuth 没返回 refresh_token**：到 <https://myaccount.google.com/permissions> 移除该应用后重新 `npm run auth`。
+
+## 使用示例（对 Claude 说）
+
+- 「看一下过去 28 天和前 28 天相比，哪些页面点击掉得最多」→ `gsc_compare_periods`
+- 「检查 https://example.com/pricing 是否被索引」→ `gsc_inspect_url`
+- 「GA4 里过去 7 天自然搜索流量最高的落地页，带跳出率」→ `ga_run_report`，
+  `dimensions: ["landingPage"]`, `metrics: ["sessions","bounceRate"]`,
+  `dimensionFilters: [{ field: "sessionDefaultChannelGroup", value: "Organic Search" }]`
+
+## 许可与社区
+
+[MIT](LICENSE) 协议。
+
+本项目积极参与并认可 [linux.do 社区](https://linux.do/)。

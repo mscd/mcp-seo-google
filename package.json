@@ -1,0 +1,86 @@
+{
+  "name": "google-seo-mcp",
+  "version": "0.12.0",
+  "description": "SEO & GEO MCP server: Google Search Console, GA4, PageSpeed Insights, structured data, llms.txt, AI crawler checks, WordPress (Yoast, WP-CLI over SSH), GitHub (in-place edits, images) and Gmail attachments as 102 tools for AI agents; optional hosted mode with Google sign-in, per-user tokens and a GitHub App for editing users' own repositories",
+  "main": "dist/index.js",
+  "scripts": {
+    "test": "node --test test/unit/ && node test/smoke.mjs && node test/oauth-http.mjs && node scripts/sync-readme.mjs --check",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "auth": "tsx src/auth.ts",
+    "inspector": "npx @modelcontextprotocol/inspector node dist/index.js",
+    "start:http": "node dist/index.js --http",
+    "check:secrets": "scripts/check-secrets.sh --all",
+    "prepare": "git config core.hooksPath .githooks",
+    "docs:sync": "node scripts/sync-readme.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "seo",
+    "geo",
+    "search-console",
+    "google-analytics",
+    "wordpress",
+    "model-context-protocol",
+    "mcp-server",
+    "generative-engine-optimization",
+    "technical-seo",
+    "pagespeed-insights",
+    "core-web-vitals",
+    "structured-data",
+    "llms-txt",
+    "yoast",
+    "claude",
+    "ai-agents",
+    "github",
+    "gmail",
+    "astro",
+    "static-site",
+    "multi-tenant",
+    "google-oauth",
+    "crux",
+    "indexnow",
+    "wayback-machine",
+    "schema-org"
+  ],
+  "type": "module",
+  "bin": {
+    "google-seo-mcp": "dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "cheerio": "^1.2.0",
+    "google-auth-library": "^11.3.1",
+    "googleapis": "^186.0.0",
+    "image-size": "^2.0.4",
+    "sharp": "^0.35.5",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "files": [
+    "dist",
+    "scripts",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "author": "Akxan",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Akxan/google-seo-mcp.git"
+  },
+  "homepage": "https://github.com/Akxan/google-seo-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/Akxan/google-seo-mcp/issues"
+  },
+  "private": true
+}

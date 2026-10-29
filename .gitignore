@@ -1,0 +1,29 @@
+node_modules/
+dist/
+*.log
+.env
+credentials.json
+service-account*.json
+client_secret*.json
+env.
+env
+.env*
+!.env.example
+CLAUDE.local.md
+.secret-patterns.local
+
+# Any JSON at the repo root is treated as a credential unless explicitly allowed
+/*.json
+!/package.json
+!/package-lock.json
+!/tsconfig.json
+secrets/
+data/
+*.pem
+
+# Subagent git worktrees (never committed)
+.claude/worktrees/
+test/tools.size.json
+
+# Host-specific compose settings (image tags, pull policy) live only on the server: deploy runs git reset --hard
+docker-compose.override.yml

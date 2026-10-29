@@ -1,0 +1,155 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## 项目是什么
+
+一个 MCP 服务（TypeScript，`@modelcontextprotocol/sdk`），把 Google Search Console、Google Analytics 4（Data API 与只读 Admin API）、网页与 GEO 审计（PageSpeed、CrUX、结构化数据、AI 爬虫、llms.txt 等）、跨数据源分析，以及可选的 WordPress（通过 SSH 执行 WP-CLI）、GitHub 读写（整文件、局部修改、服务器端转图提交）和 Gmail 附件（只读）封装成 100 个工具（准确数以 `test/tools.snap.json` 为准），用于 SEO/GEO 运维。生产环境是部署在服务器上的 Streamable HTTP 实例，所有客户端都连它；本机 stdio 只用于开发验证。面向用户的说明在 `README.md`（英文）和 `README.zh-CN.md`（中文）。
+
+## 常用命令
+
+```bash
+npm run build          # tsc 编译到 dist/（postbuild 会给 dist/index.js 加执行权限）。每次改 src 后必须重新构建：客户端跑的是 dist/，不是 src/
+npm run dev            # tsx src/index.ts（stdio，免构建）
+npm start              # node dist/index.js（stdio）
+npm run start:http     # node dist/index.js --http（或设置 MCP_TRANSPORT=http）
+npm run inspector      # 用 MCP Inspector 调试 dist/
+npm run docs:sync      # 按工具清单快照同步两份 README 与 package.json 的工具计数（npm test 会校验）
+npm run check:secrets  # 扫描所有已跟踪文件里的密钥与个人信息（提交/推送钩子会自动跑）
+npm run auth -- --client-secret ./client_secret.json   # 一次性 OAuth 授权，写入 ~/.config/google-seo-mcp/credentials.json
+npm run auth -- --gmail --client-secret ./client_secret.json   # Gmail 只读授权，写入 ~/.config/google-seo-mcp/gmail.json（附件工具用）
+```
+
+`npm test` 依次跑：`test/unit/*.test.mjs`（`node:test`，针对 `dist/` 里导出的纯函数：robots 解析、URL/路径归一化、日期、dotenv、schema 审计、工具分类；其中 `php.test.mjs` 对两个 PHP 辅助脚本做 `php -l` 并跑 `test/php/helpers.test.php`，本机没装 php 时跳过，CI 里没装就失败）、`test/smoke.mjs`（启动服务、检查描述与注解、比对 `test/tools.snap.json`，增删工具后用 `UPDATE_SNAPSHOT=1 npm test` 刷新）、`scripts/sync-readme.mjs --check`。全部不访问网络。CI（`.github/workflows/deploy.yml` 的 test 任务）在每次推送和 PR 上跑同样的东西加密钥扫描，main 只有在它通过后才部署。真实调用的验证用临时的 MCP 客户端脚本：
+
+```js
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+const c = new Client({ name: "t", version: "0" });
+await c.connect(new StdioClientTransport({ command: "node", args: ["dist/index.js"], env: { ...process.env, GOOGLE_APPLICATION_CREDENTIALS: "service-account.json", WP_SITES: "[...]" } }));
+console.log(await c.callTool({ name: "gsc_list_sites", arguments: {} }));
+```
+
+脚本要放在仓库根目录运行（需要从 `node_modules` 解析 SDK），用完删掉。测 HTTP 模式用 `curl -X POST /mcp`，带 `Authorization: Bearer` 和 `Accept: application/json, text/event-stream` 两个头。
+
+**写入类工具的测试只能作用于临时对象**：WordPress 用 `wp post create --post_status=draft` 建的草稿（测完 `--force` 删除）、临时重定向（建了就删）、与当前值相同的无变化写入；GitHub 用临时分支（`createBranch`，测完删分支）；Search Console 只重新提交已有站点地图。绝不在真实文章、真实分支上做测试写入。
+
+## 架构
+
+- `src/server.ts`：`createServer()` 创建 `McpServer` 并注册全部工具。两种传输都调用它；HTTP 传输是**每个请求新建一个服务实例**（无状态，`sessionIdGenerator: undefined`）。它包了一层 `registerTool`：按工具名推断注解（`WRITE_TOOLS`、`DESTRUCTIVE_TOOLS` 正则）、只读模式下跳过写入工具、按 `toolsetOf()` 应用工具集筛选（gsc/ga4/web/geo/analysis/wordpress/github/gmail/core），并给写入工具加审计日志：每次调用往 stderr 写一行 JSON（工具、成败、耗时、客户端 UA、`auditSummary()` 挑出的标识符如 id/repo/branch/文件路径，绝不含正文内容），线上用 `docker logs` 看；设置了 `SEO_MCP_DATA_DIR` 时同一行也追加到 `<dir>/audit.log`（容器每次重建日志就没了，文件不会），只保留 30 天（`AUDIT_RETENTION_DAYS`，就是托管隐私页承诺的那个数，改一个必须改另一个），`appendAuditLine()` 每 6 小时顺手删一次过期行。**读、删、写三步都是同步的，别改成异步**：中间一旦有 await，并发的写入工具调用就可能在「读」和「重写」之间追加一行，然后被重写覆盖掉。**新增写入类工具时必须让名字匹配这两个正则**，否则会被当成只读。服务器 instructions 在 `buildInstructions()` 里。
+- `src/prompts.ts`：MCP 提示词（客户端显示为斜杠命令）。每条声明 `needs`（依赖哪些工具集），`registerPrompts()` 只注册工具集齐全的那些，所以裁剪过的实例不会给出跑不了的命令。提示词正文里提到的工具名有单元测试校验必须真实存在，防止与工具清单脱节。**改动工具名时记得同步这里**。**所有参数必须是可选的**：Claude Code 的 VS Code 扩展根本不显示 MCP 提示词，终端版会列出但不索要参数，必填参数会让调用直接失败；缺参数时在正文里给模型可执行的指示（查或问），单元测试会校验这一点，并禁止正文里出现 undefined。新增提示词要克制：清单随每次对话传输，正文只在用户选中时才发送，所以标题与描述要短，正文可以详细。
+- `src/index.ts`：入口，根据 `--http` 参数或 `MCP_TRANSPORT=http` 选择 stdio 或 HTTP。`src/http.ts` 是纯 `node:http` 服务，带 Bearer Token 鉴权（`MCP_AUTH_TOKEN`）、`/healthz`（无令牌只返回 `{ok:true}`，带令牌附版本号与凭据来源），默认只绑回环地址。
+- `src/oauth.ts`：OAuth 2.1 授权服务，只在 `SEO_MCP_OAUTH=1` 时加载（给填不了固定令牌的客户端用，目前是 ChatGPT 插件页）。自带 `node:sqlite` 库（`oauth_clients` + `oauth_grants`，令牌只存 SHA-256），支持动态注册（RFC 7591）、PKCE S256、刷新令牌轮换与重放即撤销（RFC 9700）、`/oauth/revoke`，两份 `.well-known` 元数据（RFC 9728 / 8414，带 `/mcp` 后缀的变体也要响应）。**授权页校验的就是 `MCP_AUTH_TOKEN` 本身**，没有第二个密钥。授权出来的会话看不到 `oauth_list_grants`、`oauth_revoke_grant` 这两个运营者工具（`http.ts` 的 `OPERATOR_ONLY_TOOLS`），`mcp:read` 的授权整个实例转只读。
+- `src/digest.ts`：每周自动体检。`startDigestSchedule()` 每小时 tick 一次，到 `SEO_MCP_DIGEST_AT`（默认 `mon:08` UTC）就对 `SEO_MCP_DIGEST_SITES` 的每个站跑 `buildDigest()`（4 个并行 GSC 查询，比较前后两周），写 `<SEO_MCP_DATA_DIR>/digests/<日期>.md`，设了 `SEO_MCP_DIGEST_REPO` 再开一个 GitHub issue。标记文件 `digest-last-run` 在跑之前就写，失败也不会每小时重试。同一套比较逻辑由 `seo_digest` 工具随时手动调用。纯函数（`compare`、`renderDigest`、`parseSchedule`、`isDue`）都有单元测试。
+- `src/google.ts`：单例 `GoogleAuth`，以及 `googleapis` 客户端工厂（`searchconsole v1`、`analyticsdata v1beta`、`analyticsadmin v1beta`）。凭据查找顺序：`GOOGLE_CREDENTIALS_JSON` → `GOOGLE_APPLICATION_CREDENTIALS` → `~/.config/google-seo-mcp/credentials.json` → ADC。GA4 用的是 `googleapis` 的 REST 客户端而不是 `@google-analytics/data`，避免引入 gRPC。
+- `src/util.ts`：`tool(fn)` 包装所有处理函数，返回值经 `fitResult()` 做体积保护（超过 `SEO_MCP_MAX_RESULT_CHARS` 时对最长的数组减半直到放下，并加 `_truncated` 说明）后以**紧凑 JSON**（不缩进）写进文本内容；抛出的异常经 `formatError` 变成 `isError` 结果（缺凭据和 403 会附加提示）。`heartbeat(extra, msg)` 给长任务发进度通知，超过约 10 秒的工具都要用。`resolveDate()` 把 `today`、`yesterday`、`NdaysAgo` 转成 `YYYY-MM-DD`，因为 Search Console 只接受绝对日期。
+- `src/tools/gsc.ts`、`src/tools/ga.ts`：Google 工具。输入 schema 是传给 `registerTool` 的 zod raw shape，`.describe()` 文本要写清楚，那是 LLM 唯一能看到的说明。GA 的行数据由 `tabulate()` 拍平成 `{维度: 值, 指标: 数字}` 对象。
+  - `gsc.ts` 导出 `query()`、`normalizePath()` 供其他模块复用；`gsc_delete_*`、`gsc_add_site` 是写入工具，名字必须保持这些前缀。
+  - `ga.ts`：漏斗报告走 v1alpha，`googleapis` 没封装，用 `getAuth().getClient().request()` 直接 POST；漏斗步骤里页面条件要用 `unifiedPagePathScreen`（`pagePath` 不被接受），返回的 `metricHeaders` 会重复一遍，按名字去重后再对应 `metricValues`。`ga_property_config` 混用 admin v1beta 和 v1alpha（受众、增强型衡量只在 alpha）。`ga_check_compatibility` 在组合本身不兼容时 API 返回 400 而不是列表，已捕获成 `compatible:false`。
+- `src/tools/web.ts`：不依赖 Google 授权的网页检查（`page_audit` 用 cheerio 解析、`pagespeed`、`sitemap_check`、`robots_check`）。`collectSitemapUrls()` 和 `parseRobots()` 被 gsc 模块复用。
+- `src/tools/crawl.ts`：`site_crawl`（去重用去尾斜杠的 key，但请求始终用原始 URL，否则会误报 301 链）、`hreflang_check`、`compare_pages`（识别反爬页）、`social_preview_check`、`keyword_suggest`。
+- `src/tools/analysis.ts`：跨数据源分析（`migration_check`、`cross_site_links`、`content_refresh_candidates`、`knowledge_graph_check`、`crux_history`、`brand_mentions`、`reviews_snapshot`），依赖 `gsc.ts` 导出的 `query()` 和 `normalizePath()`。
+- `src/tools/github.ts`：GitHub REST，`github_commit_files` 用 Git Data API 一次提交多文件，每个文件三选一：`content`（整文件，`encoding: base64` 传二进制）、`edits`（对分支上当前内容做 find/replace，`applyTextEdits()` 要求每个 find 恰好匹配一次，否则整次拒绝）、`delete`；内容未变的文件自动跳过。`github_commit_image` 用 `sharp` 在服务器上取图、转 webp、缩放/裁剪（`attention` 智能裁剪）、生成变体后提交。写入正则用前缀 `github_commit_`，新加 GitHub 写入工具沿用这个前缀。token 取 `GITHUB_TOKEN`，否则 `gh auth token`。
+- `src/hosted/`：托管（多用户）模式，只在 `SEO_MCP_HOSTED_CLIENT_ID/SECRET`、`SEO_MCP_HOSTED_SECRET`、`SEO_MCP_PUBLIC_URL` 四个都设置时启用（只设一部分会在启动时报错）。`store.ts` 是 `node:sqlite` 数据库（`users` 存加密的刷新令牌，`tokens` 只存哈希）和纯函数（AES-256-GCM、令牌格式 `seo_`、HMAC 签名的 cookie），有单元测试；`pages.ts` 是中英文 HTML（首页、控制台、隐私、条款，内联 CSS，无 JS）；`index.ts` 是路由（`/`、`/login`、`/oauth/callback`、`/dashboard`、`/tokens`、`/tokens/revoke`、`/disconnect`、`/logout`、`/privacy`、`/terms`、`/robots.txt`）和 `resolve(bearer)`。`http.ts` 收到非运营者令牌时用它解析成用户，`createServer(HOSTED_SERVER_OPTIONS)`（只读、`gsc,ga4,web,geo,analysis`、排除 `ai_citation_check`/`reviews_snapshot`/`brand_mentions` 这些花运营者付费额度的工具），并用 `google.ts` 的 `runWithAuth()`（`AsyncLocalStorage`）包住 `handleRequest`，工具里所有 `getAuth()` 就都拿到该用户的 OAuth 客户端。改动 `google.ts` 时别破坏这个作用域。用户只读 scope 在 `HOSTED_SCOPES`，加写入 scope 前先想清楚责任。`githubApp.ts` 是 GitHub App 集成（五个 `SEO_MCP_GITHUB_APP_*` 变量一起设才启用）：`/connect/github` 跳到应用安装页，回调里用 GitHub 附带的 OAuth `code` 换用户令牌、核对 `installation_id` 确实属于该用户后只存安装 ID；工具需要时 `installationToken()` 用私钥签 RS256 JWT 换一小时令牌（内存缓存）。连了 GitHub 的用户 `resolve()` 返回的 options 多 `github` 工具集加 `allowWrite: ["github_commit_"]`，并排除依赖 Gmail 的 `github_commit_attachment`。`tools/github.ts` 的 `githubToken()` 在托管请求里只用 `RequestAuth.githubToken`，没有就报错，**绝不回落到运营者的 `GITHUB_TOKEN`**。
+- `src/gmail.ts` + `src/tools/gmail.ts`：Gmail 只读客户端（`GMAIL_CREDENTIALS`，默认 `~/.config/google-seo-mcp/gmail.json`，由 `npm run auth -- --gmail` 生成）与两个工具：`gmail_find_attachments`（列邮件及附件）、`github_commit_attachment`（取附件、图片走 `renderImageOutputs()` 转换、`commitBlobs()` 提交）。凭据缺失时工具返回带操作步骤的错误，不隐藏。`collectAttachments()` 是纯函数，有单元测试。
+- `src/tools/geo.ts`：GEO 与信任信号检查。`BOTS` 表维护 AI 爬虫的 robots 令牌和 UA 字符串；`SCHEMA_RULES` 是各 schema 类型的必填/推荐字段表；`analyzePage()` 是 `geo_page_score` 和 `eeat_audit` 共用的页面信号提取。`indexnow_submit` 和 `ai_citation_check` 依赖可选环境变量，缺失时返回带说明的错误而不是不注册。 `geo_answer_coverage` 走另一套：`splitBlocks()` 按 h1-h4 把正文切成段落块，`termWeights()` 给问句里的每个词按「本页有多少块包含它」加权（全页到处都有的词权重趋近 0，否则站名本身就能把重叠度顶满），`evaluateAnswer()` 判 ok/weak/buried/thin——**没有对应标题的算 weak 不算 ok**，词面重叠不等于回答了。词干是 6 字符截断，兜西语词形变化。`structured_data_audit` 除了跨页实体一致性，还查 sameAs 是否存活（`classifyLink()` 把 401/403/429 记成 blocked，不能当死链）、schema 电话是否出现在可见文字里、机构 `@id` 的接线方式（`idWiring()`）。
+- `src/tools/wp.ts`：WordPress 工具。只在设置了 `WP_SITES`（JSON 数组）或 `WP_SSH_*` 环境变量时注册。每次调用都是 `spawn` 一个 `ssh … 'cd <path> && wp …'`；所有远程参数都经 `shq()` 做 POSIX 单引号转义。大块数据（正文、构建器修改）通过 stdin 传，不放进 argv。
+  - **Yoast 20+ 的机构 `sameAs` 只来自 `facebook_site`、`twitter_site`、`other_social_urls` 三处**（见 Yoast 的 `Social_Profiles_Helper::get_organization_social_profile_fields`）。`instagram_url`、`youtube_url` 这类旧选项 Yoast 照收不误、但永远不发布，所以 `wp-helper.php` 把 Instagram、YouTube、LinkedIn、Pinterest、Wikipedia 存进 `other_social_urls`（每个平台一条），写的时候顺手清空旧选项。验证社交主页要看页面 JSON-LD 里 Organization 的 `sameAs`，不能只看设置存进去没有。
+  - Yoast 字段就是原始 post meta（`_yoast_wpseo_title`、`_yoast_wpseo_metadesc` 等）。写完 meta 后 `rebuildYoastIndexable()` 用 `wp eval` 调 Yoast 的 `Indexable_Builder`，否则前台标题不会变。`purgeCache()` 清该文章在 WP Rocket、Super Cache、W3TC、LiteSpeed 中的缓存。
+  - `scripts/wp-helper.php` 承载所有批量或需要 PHP 逻辑的操作（SEO 状态、批量 Yoast、媒体、分类、内链建议、Yoast Premium 重定向），输入输出都是 STDIN/STDOUT 的 JSON，由 `runHelper()` 调用。`wpPostIndexForHost()` 缓存全站 URL 到文章 ID 的映射，供 `gsc_opportunities` 使用。
+  - `scripts/mfn-builder.php` 处理 BeTheme（Muffin Builder）的文章，这类文章正文以 base64 加 PHP 序列化的形式存在 `mfn-page-items` meta 里，`post_content` 是空的。`ensureHelper()` 在 sha256 不一致时把脚本上传到主机的 `~/.google-seo-mcp/`，再用 `wp eval-file` 执行。`eval-file` 的代码跑在函数作用域内，PHP 里不能依赖 `global` 变量。`set` 动作会重新生成 `mfn-page-items-seo` 并调用 `wp_update_post`，让 Yoast 和缓存插件感知到变化。 折叠栏、标签页、FAQ 这类条目在 `attr` 里是列表（`tabs: [{title, content}, ...]`），`mfn_summarize()` 把每条展开成 `tabs.2.content` 这样的路径，`set` 按路径逐层走进去改；**嵌套路径原则上只能替换已存在的字符串**，唯一例外是紧接末尾的下一个编号（有两条时的 `tabs.2`）：会照上一条的键复制一个空壳再填值，这样主题读到的字段一个不缺；跳着写（`tabs.9`）照样拒绝，而且一批里任何一条失败整批不落地，所以不会在线上列表里留下空洞或半截条目。页眉页脚模板按语言分开（Polylang 给模板标了语言，BeTheme 按当前语言挑），但页面可以用 `mfn_header_template` / `mfn_footer_template` 这两个 meta 强制指定某个模板 ID，0 表示自动；从另一种语言复制出来的页面会把这个强制值一起带过来，于是显示错语言的页眉页脚。BeTheme 的页眉页脚是 `post_type=template` 的文章，渲染进每一页，所以 `set` 返回 `post_type`，`wp_builder_update` 见到 `template` 就清全站页面缓存**和 WP Rocket 的「已用 CSS」**（`h_clear_used_css()`，与后台「Clear Used CSS」按钮同一个调用）。后者是按 URL 单独存的精简样式，页面缓存清了它不动；模板里加了新图标或新 class，不清它就会在每一页上被丢掉样式。查它新旧看 `wpr_rucss_used_css` 表的 `submitted_at`，**不是 `modified`**（后者被别的操作碰一下就会更新，曾让三月份的样式看起来像当天生成的）。主机上没有 python3，远程调试解析 JSON 要拿回本机做。 **两个 PHP 脚本里的纯逻辑要写成独立函数并进 `test/php/helpers.test.php`**：脚本在定义了 `SEO_MCP_TEST` 时会停在分发之前（`if (defined('SEO_MCP_TEST')) return;`），测试只加载函数、不碰 WordPress。按路径改字段就是 `mfn_set_field()`，出错抛 `RuntimeException`，由 `set` 转成 `mfn_fail`。改了写入流程，除了单元测试还要照老规矩在主机临时草稿上跑一遍真实流程。
+- 部署：`Dockerfile`（镜像内含 openssh-client、`scripts/`，以 `node` 用户运行，带 HEALTHCHECK）与 `docker-compose.yml`（`env_file: .env`，挂载 `secrets/service-account.json` 与 `secrets/ssh/`，宿主 `127.0.0.1:8787`）是生产方式；`deploy/vps-self-update.sh` 在服务器上拉取、重建、健康检查，通过后清理一天以上的悬空镜像和 4 GB 以外的构建缓存（服务器与其他项目共用 Docker），`deploy/deploy-vps.sh` 从本机远程触发它；**服务器专属的 compose 设置（例如本机打的镜像标签）只能放在未跟踪的 `docker-compose.override.yml`（已 gitignore）**：部署脚本用 `git reset --hard`，服务器上对已跟踪文件的手改会在下一次部署时被悄悄冲掉（2026-10-22 全机镜像安全加固改的就是已跟踪的 compose，2026-10-23 才挪进 override）；`deploy/backup-data.sh <数据目录>` 由服务器 cron 每天跑，备份 `hosted.db` 与 `oauth.db` 到 `/var/backups/google-seo-mcp/`（保留 14 天，每份做 `integrity_check`）。**这两个库绝不能用 `cp` 备份**：都是 WAL 模式，数据在 `-wal` 文件里等 checkpoint，生产上曾是 `.db` 4 KB、`-wal` 539 KB，复制出来的 `.db` 连表都没有；只能用 `sqlite3 .backup`。**停了容器也一样**：服务退出时不做 checkpoint，2026-09-24 演练时停机后 WAL 原封不动还在，所以「先停服务再 cp」也不安全。恢复时必须先删掉旧的 `-wal`/`-shm` 再放回备份，否则旧 WAL 会叠加到恢复的库上。`deploy/` 里另有 systemd、Caddy、Nginx 样例（Nginx 必须 `proxy_buffering off`，否则 SSE 不通）。`src/env.ts` 按包根目录定位 `.env`，容器内由 compose 提供环境变量。`sharp` 靠平台预编译包：在 Mac 上 `npm install` 时 lockfile 会一并写入 `@img/sharp-linuxmusl-x64`，Docker（Alpine）里 `npm ci` 才装得上；升级 sharp 后确认 lockfile 里仍有 linuxmusl 条目。
+
+## 公共仓库规则（必须遵守）
+
+本项目公开在 GitHub `Akxan/google-seo-mcp`。
+
+- **绝不泄露任何个人与站点信息，一个字都不行。** 凡是经 git 或 GitHub 离开本机的东西都是永久公开的，而且删不干净：改写历史只能改自己的仓库，别人 fork 里的副本碰不到（2026-09-26 就因为站点名写进了 9 条提交说明、而仓库已有 3 个 fork，事后只能改写本仓库，fork 里的照旧留着）。
+  - **会公开的渠道**：文件内容（含代码注释、CHANGELOG、README、测试数据、工具描述）、**提交说明**、标签说明、分支名、GitHub 上的发行说明、合并请求与议题的标题和正文、评论。
+  - **不能出现的东西**：用户的站点域名或站点名、服务器 IP 与主机名、SSH 用户名、账号与资源 ID（GA4、GSC、GCP 项目、服务账号）、邮箱、任何密钥与令牌、带用户名的本机路径、站点上的真实页面地址与标题、客户或访客数据。
+  - **一律用占位写法**：`example.com`、`octocat/my-site`；提到用户的站就写「WordPress 站」「静态站」「生产站点」。记实测结果时写现象不写站名（「一个站被误报 328 张」而不是写出站名）。
+  - **防线**：pre-commit 扫暂存文件，commit-msg 扫提交说明，pre-push 再扫要推送的每个文件树和每条说明。规则里的站点专属标识放在 `.secret-patterns.local`（gitignored）；**出现新的站点、ID 或主机时，先把它加进这个文件再干活**，扫描器只认得它知道的东西。
+  - **钩子管不到 GitHub 网页上的文字**：`gh release create`、`gh pr create`、`gh issue create/comment` 之前，先把要发的正文写进临时文件，用 `scripts/check-secrets.sh --message <文件>` 扫一遍，通过了再发。
+  - 发现已经泄露：立刻停下告诉用户，说清楚泄露了什么、在哪、能不能收回；不要自己决定改写历史。
+
+- **main 分支有保护（2026-09-30 起）**：禁止强制推送、禁止删除，对管理员同样生效；不要求合并请求和审批，所以平常直接推送、合并 Dependabot 都不受影响。改写历史这类必须强推的操作，要先经用户同意、用 `gh api -X DELETE repos/Akxan/google-seo-mcp/branches/main/protection` 临时解除，做完立刻用同样的设置（`allow_force_pushes:false`、`allow_deletions:false`、`enforce_admins:true`，其余为 null）重新 PUT 回去。
+- **每次改动完成后立即 `git commit` 并 `git push`**，不积攒。**提交信息一律用中文**，说明改了什么和为什么。
+- **推送到 main 即自动部署到线上**：`.github/workflows/deploy.yml` 通过仓库 secrets（`VPS_HOST`、`VPS_USER`、`VPS_SSH_KEY`、`VPS_KNOWN_HOSTS`）用受限的部署密钥触发服务器上的 `deploy/vps-self-update.sh`（拉取、重建容器、健康检查）。test 任务在所有推送和 PR 上跑；deploy 任务只在 main、且本次推送改动了非文档文件时执行（与推送前的提交对比，不只是最后一个提交），`workflow_dispatch` 可强制部署。推送后**按提交号并指定工作流**确认部署成功：`gh run list --commit $(git rev-parse HEAD) --workflow deploy.yml`，或 `gh run watch <那次的 run id>`。**必须带 `--workflow deploy.yml`**：合并 Dependabot 的 PR 后，Dependabot 自己的「Dependabot Updates」任务也挂在同一个提交上，而且先跑完，不指定工作流就会把它当成部署（2026-09-29 就这样误报过一次「部署成功」，其实部署还在排队）。**别用 `gh run list --limit 1`**：刚推送的几秒里新任务还没登记，它返回的是上一次已经成功的部署，2026-09-26 就因此在新代码上线前调用了线上工具（写入被新旧代码不一致挡下，没造成损害）。要确认线上真跑着新代码，比对容器里的文件：`docker exec <容器> sha256sum /app/scripts/<脚本>`。失败时先看工作流日志，再看服务器容器日志。
+- **每次提交前后都要检查不含个人与敏感信息**：`scripts/check-secrets.sh` 作为 pre-commit、commit-msg 与 pre-push 钩子自动运行（`npm install` 时的 `prepare` 会设置 `core.hooksPath`）。**提交说明同样公开，而且事后改不掉**：要改只能改写历史，而别人 fork 里的副本根本碰不到（2026-09-26 发现站点名已写进 9 条说明，仓库那时已有 3 个 fork）。所以 commit-msg 钩子扫说明，pre-push 再把这次要推送的每条说明扫一遍；说明里提到站点一律写「WordPress 站」「静态站」。改动涉及文档或示例时再手动跑一次 `npm run check:secrets`。机器特有的标识（IP、用户名、域名、项目 ID）写在 `.secret-patterns.local`（gitignored）里供扫描器使用。工具描述、示例、测试里一律用 `example.com`、`octocat/my-site` 这类占位值。
+- **Dependabot 的 PR**：按 `.github/dependabot.yml` 的分组，平常每周一只有一个 npm 小版本与补丁的合并 PR（安全更新有公告就开、同时出现的合成一个；大版本单独开；Docker 基础镜像和 Actions 每月各一个），目标是线上一周只部署一次。用 `gh pr merge N --squash --delete-branch --subject "<中文标题>"` 合并，标题保持中文。一次只合并一个，`gh run watch` 等上一个部署成功再合并下一个（工作流的 concurrency 组只保留一个排队中的运行，连续合并会把中间的取消）。两个 PR 改同一文件时先合并一个，再在另一个上评论 `@dependabot rebase`。主版本升级（zod、Node、SDK）先在本地按 PR 分支构建、`npm test`，并用临时客户端脚本对比升级前后 `tools/list` 的 schema，再把修正推回 PR 分支。`npm audit` 报的漏洞若无修复版本，在代码里规避（如 `image-size` 的 `disableTypes`）并写进 CHANGELOG 的 Security 段。仓库已开启 Dependabot 告警与安全更新（2026-09-09），有漏洞会出现在 GitHub 的 Security 页并自动开修复 PR。
+- 个人与站点相关的信息只放在 `.env`（含注释）和 `CLAUDE.local.md`，两者都不入库；本文件保持通用。
+- **README.md 用英文，每次新增或修改功能都要同步更新**（工具表、配置项、限制）；`README.zh-CN.md` 是中文版，功能变化时一并更新。
+- 提交身份用仓库本地设置的 GitHub noreply 邮箱，不用个人邮箱。
+- 不要把 `.env`、`service-account.json`、`CLAUDE.local.md`、`.secret-patterns.local` 从 `.gitignore` 移除。
+
+## 新增或修改工具的完整流程
+
+1. 在对应的 `src/tools/*.ts` 模块里用 `server.registerTool` 注册；名字用 `前缀_动作` 形式，前缀决定工具集（见 `toolsetOf()`）；写入类工具名必须匹配 `WRITE_TOOLS`（删除类再匹配 `DESTRUCTIVE_TOOLS`）。每个参数都要 `.describe()`，可枚举的用 `z.enum`，描述精炼（100 个工具的定义已约 3.6 万 token）。**写入类工具必须提供 `dryRun` 参数**，返回当前值与将要做的改动而不落地。纯函数尽量导出并在 `test/unit/` 加用例。
+2. 需要新密钥的：`.env` 与 `.env.example` 各加一行带用途注释的条目；密钥缺失时抛出带申请路径的错误。
+3. `npm run build`，用临时客户端脚本对真实数据验证（写入只用临时对象），删掉脚本。
+4. `UPDATE_SNAPSHOT=1 npm test` 刷新工具清单快照，然后 `npm run docs:sync` 让两份 README 和 `package.json` 里的工具总数、分组计数自动对齐，并检查每个工具名都出现在两份 README 里，缺一个就失败（`npm test` 会跑同样的检查），再 `npm test` 确认通过。
+5. 如果新工具和已有工具功能相近，在描述首句写清「什么时候用我、什么时候用别的」（见 `gsc_opportunities` 与 `gsc_ctr_opportunities` 的互相点名）。手动更新两份 README 的工具表（新工具名和一句话说明）与配置表，必要时更新 `buildInstructions()`；在 `CHANGELOG.md` 的 Unreleased 下加一条。**照「对外形象的维护」的第二张表逐条核对**，尤其是工具总数变化时 GitHub 仓库描述要单独更新（`docs:sync` 会打印命令）。
+6. 中文提交信息，`git push`；推送会自动部署，用 `gh run watch` 看到成功后，用线上地址调一次新工具确认（`/healthz` 先通）。
+7. 涉及服务器 `.env` 的变更（新密钥、`WP_SITES`）要在服务器上同步并重启容器。
+8. 一批功能完成后发版：`npm pkg set version=x.y.z`（服务器上报的版本号从 `package.json` 读取），把 CHANGELOG 的 Unreleased 改成版本段落并更新底部链接，提交后 `git tag -a vx.y.z -m '...'`、`git push origin vx.y.z`、`gh release create vx.y.z --title ... --notes-file <文件>`（从 CHANGELOG 摘出该段写进文件，**先用 `scripts/check-secrets.sh --message <文件>` 扫过再发**）。版本号规则：新增工具或集成升次版本号（0.x.0），只修 bug 升补丁号（0.x.y），纯文档不发版。**发版前对照下面「对外形象的维护」逐条核对**，2026-09-11 的 0.7.0 就漏了架构图、关键词和仓库描述，事后才补。
+
+## 对外形象的维护（README、徽章、仓库元数据）
+
+仓库是公开的，README 和仓库元数据就是产品页面。按「谁来维护」分三类，**改动前先确认自己属于哪一类**。
+
+### 一、自动维护，不要手改
+
+| 内容 | 由什么生成 | 校验 |
+|---|---|---|
+| 两份 README 与 `package.json` 的工具总数、分组计数 | `npm run docs:sync` | `npm test` 跑 `sync-readme.mjs --check` |
+| 两份 README 正文里的 token 估算（`34k tokens`、`约 3.4 万 token`） | 同上，数据来自 `test/tools.size.json`（`test/smoke.mjs` 每次跑时写出，已 gitignore） | 同上 |
+| 工具数徽章 | shields 动态徽章直读 `test/tools.snap.json` | 无需 |
+| 发行版徽章、部署徽章 | GitHub Releases / Actions | 无需 |
+
+两个陷阱：
+
+- **README 正文里不能出现「数字 + tools」**：`sync-readme.mjs` 用 `/\b\d+ tools\b/g` 全局替换成总数，写别的数量（例如裁剪后的子集）会被悄悄改错。要提子集数量就改措辞（`58 of them`、`a 58-tool subset`）或放进表格用纯数字。
+- **token 估算只认两种写法**：英文 `34k tokens`、中文 `约 3.4 万 token`。写成别的格式就不会被同步，会慢慢过期。
+
+### 二、有明确触发条件，必须手动更新
+
+| 触发条件 | 要改什么 |
+|---|---|
+| 新增或改动工具 | 两份 README 的工具表（名字 + 一句话说明）、配置表（新密钥）、`CHANGELOG.md`；值得展示的新工具加进示例提示 |
+| 接入新的外部服务或数据源 | README 的 **Tech stack** 表、**Architecture** 的 mermaid 图（External 节点）、**Keywords** 段；`package.json` 的 `description` 与 `keywords` |
+| 工具总数变化 | **GitHub 仓库描述**：`npm run docs:sync` 会在 `package.json` 描述变动时打印现成的 `gh repo edit --description ...` 命令，照抄执行即可。描述不在仓库里，没有任何自动校验，只能靠这一步 |
+| 运行环境要求变化 | 这里是**两组**数字，不要混为一谈、也不要「对齐」成同一个数：<br>**对外的最低要求**——`package.json` 的 `engines` 与 README 的 Tech stack 的 Runtime 行，两处必须一致，且不低于依赖的实际下限（现在是 22，`googleapis` 定的）。写低了是真 bug：照着它装的人跑不起来（2026-09-24 修过一次，README 还写着 18）。<br>**我们自己构建与运行的版本**——`Dockerfile` 的 `FROM node:` 与 CI 的 `node-version`，两处一致即可，只要不低于上面那组。它比最低要求新是正常的（现在是 26），不要为了「四处一致」把它降下来，也不要把最低要求抬上去、平白挡住还跑得动的用户 |
+| 新增集成领域 | 仓库主题：`gh repo edit --add-topic x --remove-topic y`。**上限 20 个且已用满**，加新的必须先删旧的；优先删含义模糊或过于宽泛的（2026-09-17 删掉 `geo`（易被理解成地理）与 `seo-tools`（太泛），换成 `github` 与 `indexnow`） |
+| 发版 | 版本号、CHANGELOG 段落、tag、GitHub Release（见「新增或修改工具的完整流程」第 8 步）。发行说明用英文、按领域分组，口径与 README 一致 |
+| 发版之后 | 看一眼 GitHub 的 Security 页：新依赖可能立刻带来 Dependabot 告警（sharp 0.34 在 0.7.0 发布几分钟后就报了两个高危） |
+
+### 三、明确不做
+
+- 不为纯文档或重构提交改版本号。
+- 不手改徽章数字，不手改由脚本同步的计数。
+- 描述和 README 里不写无法验证的形容词（「最强」「最全」之类），只写能对照工具清单核实的事实。
+- **不发布到 npm 或 MCP 注册中心**（用户决定，2026-09-09）：`package.json` 标了 `private: true`，安装方式只有 clone 加构建。
+
+## 配置与密钥
+
+- **`.env` 是唯一真源**（gitignored）：Google 凭据路径、各 API 密钥、`WP_SITES`、可选第三方密钥、HTTP 模式参数，外加注释形式的站点信息、资源 ID、客户端配置位置和依赖清单。`src/env.ts` 在 `index.ts` / `auth.ts` 启动时读取它（按包根目录定位，与工作目录无关；已存在的环境变量优先）。`.env.example` 是脱敏模板。
+- **服务器有自己的一份 `.env`**（位置见 `CLAUDE.local.md`），不会自动同步；`secrets/` 目录整体只读挂载到容器 `/secrets`（服务账号 JSON，可选的 `gmail.json`）：新增或更换密钥要本机和服务器各改一次，服务器改完需要 `docker compose up -d` 重启容器才生效（`env_file` 只在启动时读取）。
+- 客户端（Claude Code、桌面 App、网页、手机）都连生产 HTTP 实例，认证一律是请求头 `Authorization: Bearer <MCP_AUTH_TOKEN>`（Claude Code 用 `claude mcp add --transport http --header`，claude.ai 连接器在「Request headers」里填）；本机不再有 stdio 注册。新工具部署后客户端在下一次新对话自动拿到，不需要重连。
+- 新增需要密钥的工具时：在 `.env` 和 `.env.example` 各加一行带用途注释的条目，工具在密钥缺失时抛出带申请路径的错误（不要在注册阶段隐藏工具）。
+- **Gmail 附件工具的授权**：Gmail API 要在 GCP 项目里启用，OAuth 客户端类型是「桌面应用」，同意屏幕处于测试状态时把自己的邮箱加为测试用户；本机 `npm run auth -- --gmail --client-secret ./client_secret.json` 生成 `~/.config/google-seo-mcp/gmail.json`（只读 scope），复制到服务器 `secrets/gmail.json`（600）后 `docker compose up -d`，compose 已把 `GMAIL_CREDENTIALS` 指到 `/secrets/gmail.json`。
+- **托管模式的密钥**：`SEO_MCP_HOSTED_CLIENT_ID/SECRET` 是 GCP 里「Web 应用」类型的 OAuth 客户端（重定向 URI `<SEO_MCP_PUBLIC_URL>/oauth/callback`），和 `npm run auth` 用的桌面客户端不是同一个；`SEO_MCP_HOSTED_SECRET` 换了就等于所有人退出登录且已存的刷新令牌无法解密（用户需要重新登录）。数据库在服务器 `data/hosted.db`（容器 `/data`），由 `deploy/backup-data.sh` 每天备份（见上面「部署」）；里面是别人的凭据，不要复制到本机。同意屏幕未验证前最多 100 个用户；对外推广前先过 Google 的 OAuth 验证（需要隐私页 `/privacy`、官网、演示视频）。
+- **托管用的 GitHub App**：在 GitHub 个人设置的 Developer settings 里创建，权限 Repository → Contents: Read & write（Metadata 自动只读），勾选「Request user authorization (OAuth) during installation」，Callback URL 填 `<SEO_MCP_PUBLIC_URL>/connect/github/callback`，Webhook 取消勾选 Active，安装范围 Any account；私钥 PEM 放服务器 `secrets/github-app.pem`（600），`.env` 里 `SEO_MCP_GITHUB_APP_PRIVATE_KEY_FILE=/secrets/github-app.pem`。
+- **读环境变量一律用 `src/env.ts` 的 `envValue()`**，空值和纯空白视为未设置：Docker 的 `env_file` 会把 `KEY=` 原样传成空字符串，直接写 `process.env.X ?? 默认值` 会把空串当成有效值（曾导致 IndexNow 的 keyLocation 兜底失效）。`test/unit/util.test.mjs` 有对应用例。
+
+## 约定与注意事项
+
+- stdio 模式下除 MCP 协议外不能往 stdout 写任何东西，日志一律用 `console.error`。
+- 线上实例同时被 App、手机、Claude Code 多个会话使用。本会话改站点内容前先看容器里的审计日志和目标对象的最近修改时间，不要和另一个会话改同一篇文章或同一个文件；某个会话声称「没改过」时，以审计日志为准。
+- `.env`、`service-account.json`、`credentials.json`、`client_secret*.json` 已在 `.gitignore`，秘密不进仓库，也不要出现在工具描述里。
+- 100 个工具的定义约 3.6 万 token，每次对话都会加载：描述写得准确但不要啰嗦，新工具优先合并进现有模块而不是再拆文件；`SEO_MCP_TOOLSETS` 可按需裁剪。
+- `buildInstructions()` 里点名了推荐先用的工具（snapshot、opportunities 等），新增重要的分析类工具时把它加进去。
+- 密钥扫描器误报时，在 `scripts/check-secrets.sh` 的 `BENIGN`（合法占位值）或 `ALLOW`（合法文件）里加豁免，不要绕过钩子提交。
+- Search Console 数据延迟 2 到 3 天；URL 检查每个资源每天约 2000 次配额，不要对整站循环调用。
+- **Search Console 偶尔会对某个资源临时返回 0 行**（2026-09-30 一个站连续几次查询都是空的，几分钟后同样的查询恢复正常，与起止日期、本地还是线上都无关）。结论依赖「没有数据」时先隔几分钟重试，别把一次空结果当成「这个站没数据」。
+- **图片二进制绝不能经过模型的文字输出**：2026-09-14 App 端会话把一张 67 KB 的 WebP 以 base64 `content` 通过 `github_commit_files` 提交，头部合法、像素全是噪声（模型自己「写」出来的 base64）。加图只能走 `github_commit_image`（URL）或 `github_commit_attachment`（邮件附件），在服务器上转换后提交。0.10.0 起 `github_commit_files` 会拦截：`imageContentRefusal()` 对图片扩展名或图片文件头且超过 `MAX_INLINE_IMAGE_BYTES`（4 KB）的 base64 内容直接拒绝并点名该用哪个工具，SVG 和小图标不受影响。
+- 对基于构建器的文章，`wp_update_post` 的 `content` 参数会被主题忽略，要用 `wp_builder_*` 工具。第一次编辑某篇文章前先跑 `wp_builder_check`。

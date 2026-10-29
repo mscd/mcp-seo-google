@@ -1,0 +1,650 @@
+import { z } from "zod";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { searchconsole_v1 } from "googleapis";
+import { searchConsole } from "../google.js";
+import { resolveDate, round, tool, heartbeat } from "../util.js";
+import { wpPostIndexForHost } from "./wp.js";
+import { collectSitemapUrls, fetchWithTimeout } from "./web.js";
+import * as cheerio from "cheerio";
+
+const DIMENSIONS = ["query", "page", "country", "device", "date", "hour", "searchAppearance"] as const;
+// The API accepts only these as *filter* dimensions; filtering on "date" is rejected with HTTP 400.
+const FILTER_DIMENSIONS = ["query", "page", "country", "device", "searchAppearance"] as const;
+const SEARCH_TYPES = ["web", "image", "video", "news", "discover", "googleNews"] as const;
+const OPERATORS = ["equals", "notEquals", "contains", "notContains", "includingRegex", "excludingRegex"] as const;
+
+const siteUrl = z
+  .string()
+  .describe("Search Console property, e.g. 'sc-domain:example.com' (see gsc_list_sites).");
+
+const dateField = (what: string) =>
+  z.string().describe(`${what}: YYYY-MM-DD, today, yesterday or NdaysAgo (data lags 2-3 days).`);
+
+const FILTERS_HELP = "Scope the analysis, e.g. page contains '/es/' for one language folder. Defaults to the whole property.";
+
+const filterSchema = z.object({
+  dimension: z.enum(FILTER_DIMENSIONS),
+  operator: z.enum(OPERATORS).default("equals"),
+  expression: z.string().describe("Value; device: DESKTOP/MOBILE/TABLET, country: 3-letter code like 'usa'."),
+});
+
+export type Row = { keys: Record<string, string>; clicks: number; impressions: number; ctr: number | null; position: number | null };
+
+function mapRows(rows: searchconsole_v1.Schema$ApiDataRow[] | undefined, dimensions: readonly string[]): Row[] {
+  return (rows ?? []).map((r) => {
+    const keys: Record<string, string> = {};
+    dimensions.forEach((d, i) => (keys[d] = r.keys?.[i] ?? ""));
+    return {
+      keys,
+      clicks: r.clicks ?? 0,
+      impressions: r.impressions ?? 0,
+      ctr: round(r.ctr, 4),
+      position: round(r.position, 2),
+    };
+  });
+}
+
+export function normalizePath(url: string): string {
+  try {
+    const u = new URL(url);
+    const p = u.pathname.replace(/\/+$/, "") || "/";
+    return p.toLowerCase();
+  } catch {
+    return url.replace(/\?.*$/, "").replace(/\/+$/, "") || "/";
+  }
+}
+
+function flatten(rows: Row[]) {
+  return rows.map((r) => ({ ...r.keys, clicks: r.clicks, impressions: r.impressions, ctr: r.ctr, position: r.position }));
+}
+
+// searchanalytics.query never returns more than 25000 rows in one call; the analysis tools ask for that many at once.
+export const MAX_ROWS = 25000;
+
+/** Tells the caller a full-limit response came back, i.e. the analysis below is missing rows. Pure: exported for tests. */
+export function truncationOf(rowCount: number, limit: number = MAX_ROWS) {
+  return rowCount >= limit
+    ? {
+        truncated: true,
+        truncationNote: `The API returned its maximum of ${limit} rows, so this analysis covers only part of the property. Shorten the period or add a filter (e.g. page contains '/blog/') and run it again.`,
+      }
+    : { truncated: false };
+}
+
+const MAX_REFERRING_URLS = 5;
+
+/** Flattens one URL Inspection result into the compact row gsc_index_coverage returns. Pure: exported for tests. */
+export function summarizeInspection(url: string, result: searchconsole_v1.Schema$UrlInspectionResult | undefined) {
+  const idx = result?.indexStatusResult;
+  const canonicalMismatch = Boolean(idx?.googleCanonical && idx.userCanonical && idx.googleCanonical !== idx.userCanonical);
+  const sitemaps = idx?.sitemap ?? [];
+  const referring = idx?.referringUrls ?? [];
+  const richResults = (result?.richResultsResult?.detectedItems ?? []).map((d) => {
+    const issues = new Map<string, { severity: string | null; message: string | null; items: number }>();
+    for (const item of d.items ?? [])
+      for (const issue of item.issues ?? []) {
+        const key = `${issue.severity}|${issue.issueMessage}`;
+        const seen = issues.get(key) ?? { severity: issue.severity ?? null, message: issue.issueMessage ?? null, items: 0 };
+        seen.items++;
+        issues.set(key, seen);
+      }
+    return { type: d.richResultType, items: d.items?.length ?? 0, issues: issues.size ? [...issues.values()] : undefined };
+  });
+  // Google omits sitemap/referringUrls entirely on partial results, so "absent" is not the same as "none".
+  // Only call a URL orphaned when the inspection came back complete (lastCrawlTime present) and both lists are genuinely empty.
+  const complete = Boolean(idx?.lastCrawlTime);
+  const orphan = complete && idx?.verdict === "PASS" && !sitemaps.length && !referring.length;
+  return {
+    url,
+    verdict: idx?.verdict,
+    coverageState: idx?.coverageState,
+    indexingState: idx?.indexingState,
+    robotsTxtState: idx?.robotsTxtState,
+    pageFetchState: idx?.pageFetchState,
+    lastCrawlTime: idx?.lastCrawlTime,
+    crawledAs: idx?.crawledAs,
+    googleCanonical: idx?.googleCanonical,
+    userCanonical: idx?.userCanonical,
+    canonicalMismatch,
+    sitemaps: sitemaps.length ? sitemaps : undefined,
+    referringUrls: referring.length ? referring.slice(0, MAX_REFERRING_URLS) : undefined,
+    referringUrlsTotal: referring.length > MAX_REFERRING_URLS ? referring.length : undefined,
+    orphan: orphan ? true : undefined,
+    mobileUsability: result?.mobileUsabilityResult?.verdict,
+    richResults: richResults.length ? richResults : undefined,
+    problem: idx?.verdict !== "PASS" || canonicalMismatch,
+  };
+}
+
+export async function query(params: {
+  siteUrl: string;
+  startDate: string;
+  endDate: string;
+  dimensions: readonly (typeof DIMENSIONS)[number][];
+  searchType?: string;
+  rowLimit?: number;
+  startRow?: number;
+  filters?: z.infer<typeof filterSchema>[];
+  dataState?: string;
+  aggregationType?: string;
+}) {
+  const res = await searchConsole().searchanalytics.query({
+    siteUrl: params.siteUrl,
+    requestBody: {
+      startDate: resolveDate(params.startDate),
+      endDate: resolveDate(params.endDate),
+      dimensions: [...params.dimensions],
+      type: params.searchType,
+      rowLimit: params.rowLimit,
+      startRow: params.startRow,
+      dataState: params.dataState,
+      aggregationType: params.aggregationType,
+      dimensionFilterGroups: params.filters?.length
+        ? [{ groupType: "and", filters: params.filters.map((f) => ({ dimension: f.dimension, operator: f.operator, expression: f.expression })) }]
+        : undefined,
+    },
+  });
+  return mapRows(res.data.rows, params.dimensions);
+}
+
+export function registerSearchConsoleTools(server: McpServer) {
+  server.registerTool(
+    "gsc_list_sites",
+    {
+      title: "List Search Console properties",
+      description: "List all Search Console properties (sites) the authorized account can access, with permission level.",
+      inputSchema: {},
+    },
+    tool(async () => {
+      const res = await searchConsole().sites.list();
+      return (res.data.siteEntry ?? []).map((s) => ({ siteUrl: s.siteUrl, permissionLevel: s.permissionLevel }));
+    }),
+  );
+
+  server.registerTool(
+    "gsc_search_analytics",
+    {
+      title: "Search Console performance report",
+      description:
+        "Search performance (clicks, impressions, CTR, position) grouped by query, page, country, device, date or searchAppearance, with filters and pagination.",
+      inputSchema: {
+        siteUrl,
+        startDate: dateField("Start"),
+        endDate: dateField("End"),
+        dimensions: z.array(z.enum(DIMENSIONS)).default(["query"]).describe("Group-by; [] for totals, ['date'] for a trend."),
+        searchType: z.enum(SEARCH_TYPES).default("web"),
+        rowLimit: z.number().int().min(1).max(25000).default(100),
+        startRow: z.number().int().min(0).default(0).describe("Pagination offset."),
+        filters: z.array(filterSchema).optional().describe("All filters are AND-ed."),
+        dataState: z.enum(["final", "all", "hourly_all"]).default("final").describe("'all' includes fresh, not yet final, data. 'hourly_all' is required for (and only works with) the 'hour' dimension, which returns up to the last 10 days broken down by hour: use it to confirm within hours that a republished page or a fixed canonical is being picked up, instead of waiting out the usual 2-3 day lag."),
+        aggregationType: z.enum(["auto", "byPage", "byProperty"]).optional(),
+      },
+    },
+    tool(async (args) => {
+      if (args.dimensions.includes("hour") && args.dataState !== "hourly_all") throw new Error("The 'hour' dimension requires dataState='hourly_all'.");
+      if (args.dataState === "hourly_all" && !args.dimensions.includes("hour")) throw new Error("dataState='hourly_all' only applies to the 'hour' dimension; use 'all' for fresh daily data.");
+      const rows = await query(args);
+      const totals = rows.reduce(
+        (t, r) => ({ clicks: t.clicks + r.clicks, impressions: t.impressions + r.impressions }),
+        { clicks: 0, impressions: 0 },
+      );
+      return {
+        siteUrl: args.siteUrl,
+        startDate: resolveDate(args.startDate),
+        endDate: resolveDate(args.endDate),
+        rowCount: rows.length,
+        totalsOfReturnedRows: totals,
+        rows: flatten(rows),
+      };
+    }),
+  );
+
+  server.registerTool(
+    "gsc_compare_periods",
+    {
+      title: "Compare two periods in Search Console",
+      description:
+        "Compare a current and a previous period by query, page, country, device, searchAppearance or date; rows carry deltas, sorted by click change (winners and losers).",
+      inputSchema: {
+        siteUrl,
+        dimension: z
+          .enum(["query", "page", "country", "device", "searchAppearance", "date"])
+          .default("page")
+          .describe("What to compare. 'date' pairs no keys between the periods, so use it for a day-by-day trend, not for winners/losers."),
+        currentStart: dateField("Current period start"),
+        currentEnd: dateField("Current period end"),
+        previousStart: dateField("Previous period start"),
+        previousEnd: dateField("Previous period end"),
+        searchType: z.enum(SEARCH_TYPES).default("web"),
+        rowLimit: z.number().int().min(1).max(5000).default(500).describe("Rows fetched per period before joining."),
+        filters: z.array(filterSchema).optional(),
+        top: z.number().int().min(1).max(500).default(50).describe("How many winners and losers to return."),
+        dataState: z.enum(["final", "all"]).default("final").describe("'all' includes fresh, not yet final data (the last 2-3 days)."),
+        aggregationType: z.enum(["auto", "byPage", "byProperty"]).optional().describe("byPage vs byProperty changes the reported average position."),
+      },
+    },
+    tool(async (args) => {
+      const [current, previous] = await Promise.all([
+        query({ ...args, dimensions: [args.dimension], startDate: args.currentStart, endDate: args.currentEnd }),
+        query({ ...args, dimensions: [args.dimension], startDate: args.previousStart, endDate: args.previousEnd }),
+      ]);
+      const byKey = new Map<string, { current?: Row; previous?: Row }>();
+      for (const r of current) byKey.set(r.keys[args.dimension], { current: r });
+      for (const r of previous) {
+        const k = r.keys[args.dimension];
+        byKey.set(k, { ...byKey.get(k), previous: r });
+      }
+      const merged = [...byKey.entries()].map(([key, { current: c, previous: p }]) => ({
+        [args.dimension]: key,
+        clicks: c?.clicks ?? 0,
+        clicksPrev: p?.clicks ?? 0,
+        clicksDelta: (c?.clicks ?? 0) - (p?.clicks ?? 0),
+        impressions: c?.impressions ?? 0,
+        impressionsPrev: p?.impressions ?? 0,
+        impressionsDelta: (c?.impressions ?? 0) - (p?.impressions ?? 0),
+        ctr: c?.ctr ?? null,
+        ctrPrev: p?.ctr ?? null,
+        position: c?.position ?? null,
+        positionPrev: p?.position ?? null,
+        positionDelta: c?.position != null && p?.position != null ? round(c.position - p.position, 2) : null,
+      }));
+      const sum = (rows: Row[], k: "clicks" | "impressions") => rows.reduce((a, r) => a + r[k], 0);
+      merged.sort((a, b) => b.clicksDelta - a.clicksDelta);
+      return {
+        siteUrl: args.siteUrl,
+        dimension: args.dimension,
+        dataState: args.dataState,
+        current: { start: resolveDate(args.currentStart), end: resolveDate(args.currentEnd), clicks: sum(current, "clicks"), impressions: sum(current, "impressions") },
+        previous: { start: resolveDate(args.previousStart), end: resolveDate(args.previousEnd), clicks: sum(previous, "clicks"), impressions: sum(previous, "impressions") },
+        winners: merged.filter((r) => r.clicksDelta > 0).slice(0, args.top),
+        losers: merged.filter((r) => r.clicksDelta < 0).reverse().slice(0, args.top),
+        new: merged.filter((r) => r.clicksPrev === 0 && r.clicks > 0).length,
+        lost: merged.filter((r) => r.clicks === 0 && r.clicksPrev > 0).length,
+      };
+    }),
+  );
+
+  server.registerTool(
+    "gsc_inspect_url",
+    {
+      title: "Inspect a URL (index status)",
+      description:
+        "Run the URL Inspection API for a page: index status, last crawl time, canonical selection, robots.txt state, mobile usability, rich results and AMP status. Quota: ~2000 calls/day per property.",
+      inputSchema: {
+        siteUrl,
+        inspectionUrl: z.string().url().describe("Full URL of the page to inspect. Must belong to the property."),
+        languageCode: z.string().default("en-US").describe("BCP-47 language for the response messages, e.g. 'zh-CN'."),
+      },
+    },
+    tool(async (args) => {
+      const res = await searchConsole().urlInspection.index.inspect({
+        requestBody: { siteUrl: args.siteUrl, inspectionUrl: args.inspectionUrl, languageCode: args.languageCode },
+      });
+      return res.data.inspectionResult;
+    }),
+  );
+
+  server.registerTool(
+    "gsc_list_sitemaps",
+    {
+      title: "List sitemaps",
+      description:
+        "List sitemaps submitted for a property, with last submitted/downloaded times, errors, warnings and URL counts. Pass sitemapIndex to list the child sitemaps inside an index file with their own counts.",
+      inputSchema: {
+        siteUrl,
+        sitemapIndex: z
+          .string()
+          .url()
+          .optional()
+          .describe("Sitemap index URL, e.g. 'https://example.com/sitemap_index.xml': lists its child sitemaps instead of the submitted ones, which is how you find which child file holds the errors or warnings."),
+      },
+    },
+    tool(async (args) => {
+      const res = await searchConsole().sitemaps.list({ siteUrl: args.siteUrl, sitemapIndex: args.sitemapIndex });
+      return res.data.sitemap ?? [];
+    }),
+  );
+
+  server.registerTool(
+    "gsc_submit_sitemap",
+    {
+      title: "Submit a sitemap",
+      description: "Submit (or resubmit) a sitemap URL for a property.",
+      inputSchema: {
+        siteUrl,
+        feedpath: z.string().url().describe("Absolute sitemap URL, e.g. 'https://example.com/sitemap.xml'."),
+      },
+    },
+    tool(async (args) => {
+      await searchConsole().sitemaps.submit({ siteUrl: args.siteUrl, feedpath: args.feedpath });
+      return { submitted: args.feedpath };
+    }),
+  );
+  server.registerTool(
+    "gsc_opportunities",
+    {
+      title: "Find quick-win keywords (striking distance)",
+      description:
+        "Ranks near the first page but not on it. Striking-distance keywords: high impressions at position 8-20 (configurable), grouped by page and mapped to WordPress post IDs when a site is configured. Already in the top 10 but under-clicked is gsc_ctr_opportunities instead.",
+      inputSchema: {
+        siteUrl,
+        startDate: dateField("Start").default("28daysAgo"),
+        endDate: dateField("End").default("3daysAgo"),
+        minPosition: z.number().min(1).default(8),
+        maxPosition: z.number().min(1).default(20),
+        minImpressions: z.number().int().min(1).default(20),
+        searchType: z.enum(SEARCH_TYPES).default("web"),
+        country: z.string().optional().describe("Optional 3-letter country code filter, e.g. 'esp', 'usa'."),
+        filters: z.array(filterSchema).optional().describe(FILTERS_HELP),
+        top: z.number().int().min(1).max(500).default(50),
+      },
+    },
+    tool(async (args) => {
+      const filters = [...(args.filters ?? []), ...(args.country ? [{ dimension: "country" as const, operator: "equals" as const, expression: args.country }] : [])];
+      const rows = await query({ ...args, dimensions: ["query", "page"], rowLimit: MAX_ROWS, filters: filters.length ? filters : undefined });
+      const hits = rows.filter((r) => r.position != null && r.position >= args.minPosition && r.position <= args.maxPosition && r.impressions >= args.minImpressions);
+      hits.sort((a, b) => b.impressions - a.impressions);
+      let host: string | undefined;
+      try { host = args.siteUrl.startsWith("sc-domain:") ? args.siteUrl.slice(10) : new URL(args.siteUrl).hostname; } catch { /* ignore */ }
+      const wp = host ? await wpPostIndexForHost(host).catch(() => null) : null;
+      const wpFor = (page: string) => wp?.byPath.get(normalizePath(page));
+      const byPage = new Map<string, { page: string; queries: number; impressions: number; clicks: number; bestQuery: string; wpPostId?: number; wpTitle?: string }>();
+      for (const r of hits) {
+        const key = r.keys.page;
+        const cur = byPage.get(key) ?? { page: key, queries: 0, impressions: 0, clicks: 0, bestQuery: r.keys.query, wpPostId: wpFor(key)?.ID, wpTitle: wpFor(key)?.title };
+        cur.queries++;
+        cur.impressions += r.impressions;
+        cur.clicks += r.clicks;
+        byPage.set(key, cur);
+      }
+      return {
+        siteUrl: args.siteUrl,
+        period: { start: resolveDate(args.startDate), end: resolveDate(args.endDate) },
+        criteria: { position: [args.minPosition, args.maxPosition], minImpressions: args.minImpressions },
+        ...truncationOf(rows.length),
+        wordpressSite: wp?.site ?? null,
+        opportunities: hits.slice(0, args.top).map((r) => ({ query: r.keys.query, page: r.keys.page, clicks: r.clicks, impressions: r.impressions, ctr: r.ctr, position: r.position, wpPostId: wpFor(r.keys.page)?.ID ?? null })),
+        pages: [...byPage.values()].sort((a, b) => b.impressions - a.impressions).slice(0, args.top),
+      };
+    }),
+  );
+
+  server.registerTool(
+    "gsc_cannibalization",
+    {
+      title: "Keyword cannibalization",
+      description:
+        "Run this when rankings look stuck despite good content. Finds queries for which two or more pages receive impressions, i.e. pages competing against each other for the same keyword. Each result lists the competing pages with clicks, impressions and position so you can consolidate or differentiate them.",
+      inputSchema: {
+        siteUrl,
+        startDate: dateField("Start").default("90daysAgo"),
+        endDate: dateField("End").default("3daysAgo"),
+        minImpressionsPerPage: z.number().int().min(1).default(10),
+        searchType: z.enum(SEARCH_TYPES).default("web"),
+        top: z.number().int().min(1).max(500).default(50),
+        filters: z.array(filterSchema).optional().describe(FILTERS_HELP),
+      },
+    },
+    tool(async (args) => {
+      const rows = await query({ ...args, dimensions: ["query", "page"], rowLimit: MAX_ROWS });
+      const byQuery = new Map<string, Row[]>();
+      for (const r of rows) {
+        if (r.impressions < args.minImpressionsPerPage) continue;
+        const list = byQuery.get(r.keys.query) ?? [];
+        list.push(r);
+        byQuery.set(r.keys.query, list);
+      }
+      const result = [...byQuery.entries()]
+        .filter(([, list]) => list.length >= 2)
+        .map(([q, list]) => ({
+          query: q,
+          pages: list.length,
+          totalImpressions: list.reduce((a, r) => a + r.impressions, 0),
+          totalClicks: list.reduce((a, r) => a + r.clicks, 0),
+          competing: list.sort((a, b) => b.impressions - a.impressions).map((r) => ({ page: r.keys.page, clicks: r.clicks, impressions: r.impressions, position: r.position })),
+        }))
+        .sort((a, b) => b.totalImpressions - a.totalImpressions);
+      return { siteUrl: args.siteUrl, period: { start: resolveDate(args.startDate), end: resolveDate(args.endDate) }, ...truncationOf(rows.length), cannibalizedQueries: result.length, results: result.slice(0, args.top) };
+    }),
+  );
+
+  server.registerTool(
+    "gsc_index_coverage",
+    {
+      title: "Batch index coverage check",
+      description:
+        "Use this for a batch; gsc_inspect_url returns the full raw result for a single URL. URL Inspection over a list of URLs or the first N sitemap URLs: verdict, coverage state, robots, last crawl, canonical mismatch, the sitemaps listing the URL, its referring URLs (first 5, referringUrlsTotal when more) and rich-result issues with severity. orphan=true means indexed but in no sitemap and with no known links to it; it is only set when the inspection came back complete, because Google omits both lists on partial results. One quota call (~2000/day) per URL, keep batches small.",
+      inputSchema: {
+        siteUrl,
+        urls: z.array(z.string().url()).max(100).optional().describe("Explicit URLs to inspect."),
+        sitemapUrl: z.string().url().optional().describe("Alternatively, take URLs from this sitemap (index supported)."),
+        limit: z.number().int().min(1).max(100).default(25).describe("Max URLs when reading from the sitemap."),
+        onlyProblems: z.boolean().default(false).describe("Return only URLs that are not indexed or have a canonical mismatch."),
+        languageCode: z.string().default("en-US"),
+      },
+    },
+    tool(async (args, extra) => {
+      const stop = heartbeat(extra, "inspecting URLs");
+      try {
+      let urls = args.urls ?? [];
+      if (!urls.length && args.sitemapUrl) urls = (await collectSitemapUrls(args.sitemapUrl, { maxUrls: args.limit })).urls.map((u) => u.loc);
+      if (!urls.length) throw new Error("Provide urls[] or sitemapUrl.");
+      const api = searchConsole();
+      const results: Record<string, unknown>[] = [];
+      let i = 0;
+      await Promise.all(
+        Array.from({ length: 6 }, async () => {   // URL Inspection API: 600 requests/min per property, each call 3-10 s on Google's side
+          while (i < urls.length) {
+            const url = urls[i++];
+            try {
+              const res = await api.urlInspection.index.inspect({ requestBody: { siteUrl: args.siteUrl, inspectionUrl: url, languageCode: args.languageCode } });
+              results.push(summarizeInspection(url, res.data.inspectionResult));
+            } catch (err) {
+              results.push({ url, error: (err as Error).message, problem: true });
+            }
+          }
+        }),
+      );
+      const summary: Record<string, number> = {};
+      for (const r of results) { const k = String(r.coverageState ?? r.error ?? "unknown"); summary[k] = (summary[k] ?? 0) + 1; }
+      const ordered = urls.map((u) => results.find((r) => r.url === u)!);
+      const orphans = results.filter((r) => r.orphan).length;
+      return { siteUrl: args.siteUrl, inspected: results.length, summary, orphans, results: args.onlyProblems ? ordered.filter((r) => r.problem) : ordered };
+      } finally { stop(); }
+    }),
+  );
+
+  server.registerTool(
+    "gsc_question_queries",
+    {
+      title: "Question queries (AI Overview / featured snippet targets)",
+      description:
+        "What to add to a page, not which page to fix. Question-style queries (how/what/why/best, cómo/qué/cuánto...) the site gets impressions for, grouped by page; optionally checks whether each page has a matching heading and FAQPage schema. Targets for FAQ sections and AI Overviews.",
+      inputSchema: {
+        siteUrl,
+        startDate: dateField("Start").default("90daysAgo"),
+        endDate: dateField("End").default("3daysAgo"),
+        minImpressions: z.number().int().min(1).default(5),
+        searchType: z.enum(SEARCH_TYPES).default("web"),
+        checkPages: z.number().int().min(0).max(30).default(15).describe("How many of the top pages to fetch and check for matching headings / FAQ schema (0 = skip)."),
+        top: z.number().int().min(1).max(500).default(100),
+        filters: z.array(filterSchema).optional().describe(FILTERS_HELP),
+      },
+    },
+    tool(async (args) => {
+      const QUESTION = /^(how|what|why|when|where|which|who|is|are|can|does|do|should|best|top|cómo|como|qué|que|por qué|cuándo|cuando|dónde|donde|cuál|cual|quién|quien|cuánto|cuanto|mejor|mejores|vale la pena|se puede|wie|was|warum|wann|wo|welche|comment|quoi|pourquoi|quand|où)\b|\?$/i;
+      const rows = await query({ ...args, dimensions: ["query", "page"], rowLimit: MAX_ROWS });
+      const qs = rows.filter((r) => r.impressions >= args.minImpressions && QUESTION.test(r.keys.query.trim())).sort((a, b) => b.impressions - a.impressions);
+      const byPage = new Map<string, Row[]>();
+      for (const r of qs) byPage.set(r.keys.page, [...(byPage.get(r.keys.page) ?? []), r]);
+      const pagesSorted = [...byPage.entries()].sort((a, b) => b[1].reduce((s, r) => s + r.impressions, 0) - a[1].reduce((s, r) => s + r.impressions, 0));
+      const STOP = new Set("the a an of in on to for and or is are with from by at as vs de la el los las en y o del al un una para con por que es se su lo how what why when where which who can does do should best top cómo como qué cuándo cuando dónde donde cuál cual cuánto cuanto".split(" "));
+      const words = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter((w) => w.length > 2 && !STOP.has(w));
+      const pageInfo = new Map<string, { faqSchema: boolean; headings: string[]; error?: string }>();
+      let i = 0;
+      const toCheck = pagesSorted.slice(0, args.checkPages).map(([p]) => p);
+      await Promise.all(Array.from({ length: 4 }, async () => {
+        while (i < toCheck.length) {
+          const url = toCheck[i++];
+          try {
+            const res = await fetchWithTimeout(url);
+            const $ = cheerio.load(await res.text());
+            const faqSchema = $('script[type="application/ld+json"]').toArray().some((el) => /"FAQPage"/.test($(el).text()));
+            const headings = $("h1, h2, h3, h4").map((_, el) => $(el).text().replace(/\s+/g, " ").trim()).get();
+            pageInfo.set(url, { faqSchema, headings });
+          } catch (e) { pageInfo.set(url, { faqSchema: false, headings: [], error: (e as Error).message }); }
+        }
+      }));
+      const pages = pagesSorted.map(([page, list]) => {
+        const info = pageInfo.get(page);
+        const questions = list.map((r) => {
+          const qw = words(r.keys.query);
+          const matched = info ? info.headings.find((h) => { const hw = new Set(words(h)); return qw.length && qw.filter((w) => hw.has(w)).length / qw.length >= 0.6; }) : undefined;
+          return { query: r.keys.query, impressions: r.impressions, clicks: r.clicks, position: r.position, headingAnswers: info ? Boolean(matched) : null, matchedHeading: matched ?? null };
+        });
+        return { page, questions: questions.length, impressions: list.reduce((s, r) => s + r.impressions, 0), clicks: list.reduce((s, r) => s + r.clicks, 0), faqSchema: info?.faqSchema ?? null, unansweredQuestions: info ? questions.filter((q) => !q.headingAnswers).length : null, topQuestions: questions.slice(0, 15) };
+      });
+      return { siteUrl: args.siteUrl, period: { start: resolveDate(args.startDate), end: resolveDate(args.endDate) }, ...truncationOf(rows.length), questionQueries: qs.length, pagesWithQuestions: pages.length, pages: pages.slice(0, args.top), suggestion: "For pages with unanswered questions: add an H2/H3 phrased like the query with a 40-60 word direct answer, and mark the section up as FAQPage." };
+    }),
+  );
+
+  server.registerTool(
+    "gsc_rich_results_report",
+    {
+      title: "Search appearance / rich results report",
+      description: "Show how the site appears in Google results: clicks and impressions per search appearance type (rich results, FAQ, review snippet, video, AMP, translated results, Discover...), and the top pages for each appearance type.",
+      inputSchema: {
+        siteUrl,
+        startDate: dateField("Start").default("90daysAgo"),
+        endDate: dateField("End").default("3daysAgo"),
+        searchType: z.enum(SEARCH_TYPES).default("web").describe("Search appearance data mostly exists for 'web'; other types can come back empty."),
+        pagesPerType: z.number().int().min(1).max(100).default(10),
+      },
+    },
+    tool(async (args) => {
+      const types = await query({ ...args, dimensions: ["searchAppearance"], rowLimit: 100 });
+      const totals = (await query({ ...args, dimensions: [], rowLimit: 1 }))[0];
+      const detail = await Promise.all(types.map(async (t) => {
+        const pages = await query({ ...args, dimensions: ["page"], rowLimit: args.pagesPerType, filters: [{ dimension: "searchAppearance", operator: "equals", expression: t.keys.searchAppearance }] });
+        return { appearance: t.keys.searchAppearance, clicks: t.clicks, impressions: t.impressions, ctr: t.ctr, position: t.position, shareOfImpressions: totals?.impressions ? round(t.impressions / totals.impressions, 3) : null, topPages: flatten(pages) };
+      }));
+      return { siteUrl: args.siteUrl, period: { start: resolveDate(args.startDate), end: resolveDate(args.endDate) }, siteTotals: totals ? { clicks: totals.clicks, impressions: totals.impressions } : null, appearances: detail.sort((a, b) => b.impressions - a.impressions), note: types.length ? undefined : "No search appearance data: the site currently shows only as plain blue links." };
+    }),
+  );
+
+  server.registerTool(
+    "gsc_site_snapshot",
+    {
+      title: "Site snapshot (one-call overview)",
+      description:
+        "One call that answers 'how is the site doing': totals for the period and the previous period of equal length (clicks, impressions, CTR, position with deltas), top queries, top pages, device and country split, and the biggest winners/losers by page. Use this first when asked for an overview or a report.",
+      inputSchema: {
+        siteUrl,
+        days: z.number().int().min(7).max(180).default(28),
+        top: z.number().int().min(3).max(50).default(10),
+        searchType: z.enum(SEARCH_TYPES).default("web"),
+        dataState: z.enum(["final", "all"]).default("final").describe("'all' includes fresh, not yet final data and ends the window yesterday instead of 3 days ago."),
+        aggregationType: z.enum(["auto", "byPage", "byProperty"]).optional().describe("byPage vs byProperty changes the reported average position."),
+        filters: z.array(filterSchema).optional().describe(FILTERS_HELP),
+      },
+    },
+    tool(async (args) => {
+      const lag = args.dataState === "all" ? 1 : 3; // days between today and the end of the window
+      const end = resolveDate(`${lag}daysAgo`);
+      const start = resolveDate(`${args.days + lag - 1}daysAgo`);
+      const prevEnd = resolveDate(`${args.days + lag}daysAgo`);
+      const prevStart = resolveDate(`${2 * args.days + lag - 1}daysAgo`);
+      const base = { siteUrl: args.siteUrl, searchType: args.searchType, filters: args.filters, dataState: args.dataState, aggregationType: args.aggregationType };
+      const [tot, prevTot, queries, pages, prevPages, devices, countries, daily] = await Promise.all([
+        query({ ...base, startDate: start, endDate: end, dimensions: [], rowLimit: 1 }),
+        query({ ...base, startDate: prevStart, endDate: prevEnd, dimensions: [], rowLimit: 1 }),
+        query({ ...base, startDate: start, endDate: end, dimensions: ["query"], rowLimit: args.top }),
+        query({ ...base, startDate: start, endDate: end, dimensions: ["page"], rowLimit: 500 }),
+        query({ ...base, startDate: prevStart, endDate: prevEnd, dimensions: ["page"], rowLimit: 500 }),
+        query({ ...base, startDate: start, endDate: end, dimensions: ["device"], rowLimit: 5 }),
+        query({ ...base, startDate: start, endDate: end, dimensions: ["country"], rowLimit: args.top }),
+        query({ ...base, startDate: start, endDate: end, dimensions: ["date"], rowLimit: 200 }),
+      ]);
+      const t = tot[0] ?? { clicks: 0, impressions: 0, ctr: null, position: null };
+      const pv = prevTot[0] ?? { clicks: 0, impressions: 0, ctr: null, position: null };
+      const pct = (c: number, p: number) => (p ? round(((c - p) / p) * 100, 1) : null);
+      const prevMap = new Map(prevPages.map((r) => [r.keys.page, r]));
+      const movers = pages.map((r) => ({ page: r.keys.page, clicks: r.clicks, clicksPrev: prevMap.get(r.keys.page)?.clicks ?? 0, delta: r.clicks - (prevMap.get(r.keys.page)?.clicks ?? 0), position: r.position }));
+      for (const [page, r] of prevMap) if (!pages.some((p) => p.keys.page === page)) movers.push({ page, clicks: 0, clicksPrev: r.clicks, delta: -r.clicks, position: null });
+      movers.sort((a, b) => b.delta - a.delta);
+      return {
+        siteUrl: args.siteUrl,
+        period: { start, end, days: args.days, dataState: args.dataState },
+        previousPeriod: { start: prevStart, end: prevEnd },
+        totals: { clicks: t.clicks, impressions: t.impressions, ctr: t.ctr, position: t.position, clicksChangePct: pct(t.clicks, pv.clicks), impressionsChangePct: pct(t.impressions, pv.impressions), positionChange: t.position != null && pv.position != null ? round(t.position - pv.position, 2) : null, previous: { clicks: pv.clicks, impressions: pv.impressions, ctr: pv.ctr, position: pv.position } },
+        topQueries: flatten(queries),
+        topPages: flatten(pages.slice(0, args.top)),
+        devices: flatten(devices),
+        countries: flatten(countries),
+        winners: movers.filter((m) => m.delta > 0).slice(0, args.top),
+        losers: movers.filter((m) => m.delta < 0).reverse().slice(0, args.top),
+        dailyClicks: daily.map((d) => ({ date: d.keys.date, clicks: d.clicks, impressions: d.impressions })),
+        rankingPages: pages.length,
+      };
+    }),
+  );
+
+  server.registerTool(
+    "gsc_ctr_opportunities",
+    {
+      title: "CTR opportunities (page-1 rankings with weak CTR)",
+      description:
+        "Ranks well but is not clicked. Queries already in the top positions whose CTR is far below the typical CTR for that position, weighted by impressions: the fastest wins from rewriting titles and meta descriptions. Not yet in the top 10 is gsc_opportunities instead. Benchmark CTR by position: 1: 28%, 2: 15%, 3: 11%, 4: 8%, 5: 7%, 6-10: 5-3%.",
+      inputSchema: { siteUrl, startDate: dateField("Start").default("28daysAgo"), endDate: dateField("End").default("3daysAgo"), maxPosition: z.number().min(1).max(20).default(10), minImpressions: z.number().int().min(1).default(30), dimension: z.enum(["query", "page"]).default("page"), top: z.number().int().min(1).max(200).default(30), searchType: z.enum(SEARCH_TYPES).default("web"), filters: z.array(filterSchema).optional().describe(FILTERS_HELP) },
+    },
+    tool(async (args) => {
+      const bench = (pos: number) => (pos <= 1 ? 0.28 : pos <= 2 ? 0.15 : pos <= 3 ? 0.11 : pos <= 4 ? 0.08 : pos <= 5 ? 0.07 : pos <= 7 ? 0.05 : pos <= 10 ? 0.03 : 0.015);
+      const rows = await query({ ...args, dimensions: args.dimension === "page" ? ["page", "query"] : ["query", "page"], rowLimit: MAX_ROWS });
+      const hits = rows.filter((r) => r.position != null && r.position <= args.maxPosition && r.impressions >= args.minImpressions).map((r) => { const b = bench(r.position!); const ctr = r.ctr ?? 0; const gap = b - ctr; return { query: r.keys.query, page: r.keys.page, clicks: r.clicks, impressions: r.impressions, position: r.position, ctr, benchmarkCtr: b, extraClicksIfBenchmark: Math.round(Math.max(0, gap) * r.impressions), title: undefined as string | undefined }; }).filter((r) => r.extraClicksIfBenchmark > 0).sort((a, b) => b.extraClicksIfBenchmark - a.extraClicksIfBenchmark);
+      const byPage = new Map<string, { page: string; potentialClicks: number; queries: number; topQuery: string }>();
+      for (const h of hits) { const e = byPage.get(h.page) ?? { page: h.page, potentialClicks: 0, queries: 0, topQuery: h.query }; e.potentialClicks += h.extraClicksIfBenchmark; e.queries++; byPage.set(h.page, e); }
+      return { siteUrl: args.siteUrl, period: { start: resolveDate(args.startDate), end: resolveDate(args.endDate) }, ...truncationOf(rows.length), opportunities: hits.slice(0, args.top), pages: [...byPage.values()].sort((a, b) => b.potentialClicks - a.potentialClicks).slice(0, args.top), note: "extraClicksIfBenchmark = impressions x (benchmark CTR - current CTR) for the period; rewrite title/description of the top pages first." };
+    }),
+  );
+
+  server.registerTool(
+    "gsc_delete_sitemap",
+    {
+      title: "Delete a sitemap",
+      description: "Remove a sitemap from a Search Console property (Google stops reading it; the file itself is untouched). Use gsc_list_sitemaps first to get the exact feedpath.",
+      inputSchema: { siteUrl, feedpath: z.string().url() },
+    },
+    tool(async (args) => {
+      await searchConsole().sitemaps.delete({ siteUrl: args.siteUrl, feedpath: args.feedpath });
+      return { deleted: args.feedpath, siteUrl: args.siteUrl };
+    }),
+  );
+
+  server.registerTool(
+    "gsc_add_site",
+    {
+      title: "Add a property to Search Console",
+      description: "Add a URL-prefix property (e.g. 'https://example.com/') to the authorized account's Search Console. Ownership still has to be verified in the Search Console UI (DNS record, HTML file or tag) before data appears. Domain properties ('sc-domain:') cannot be added through the API.",
+      inputSchema: { siteUrl: z.string().url().describe("URL-prefix property to add, with trailing slash.") },
+    },
+    tool(async (args) => {
+      await searchConsole().sites.add({ siteUrl: args.siteUrl });
+      const res = await searchConsole().sites.get({ siteUrl: args.siteUrl });
+      return { added: args.siteUrl, permissionLevel: res.data.permissionLevel, note: "Verify ownership in Search Console if permissionLevel is siteUnverifiedUser." };
+    }),
+  );
+
+  server.registerTool(
+    "gsc_delete_site",
+    {
+      title: "Remove a property from Search Console",
+      description: "Remove a property from the authorized account (the account loses access; other owners keep theirs). Irreversible for this account until re-added and re-verified.",
+      inputSchema: { siteUrl, confirm: z.literal(true).describe("Must be true to proceed.") },
+    },
+    tool(async (args) => {
+      await searchConsole().sites.delete({ siteUrl: args.siteUrl });
+      return { removed: args.siteUrl };
+    }),
+  );
+
+}
