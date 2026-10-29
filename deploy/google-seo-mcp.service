@@ -10,6 +10,9 @@ User=seo
 Group=seo
 WorkingDirectory=/opt/google-seo-mcp
 EnvironmentFile=/etc/google-seo-mcp.env
+StateDirectory=google-seo-mcp
+StateDirectoryMode=0700
+Environment=SEO_MCP_DATA_DIR=/var/lib/google-seo-mcp
 ExecStart=/usr/bin/node /opt/google-seo-mcp/dist/index.js --http
 Restart=always
 RestartSec=5

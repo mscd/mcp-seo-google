@@ -35,9 +35,9 @@ function bearer(req: http.IncomingMessage): string {
   return header.startsWith("Bearer ") ? header.slice(7) : "";
 }
 
-/** Operator token (or no token configured at all). */
+/** Missing configuration never grants operator privileges. */
 function authorized(req: http.IncomingMessage): boolean {
-  if (!TOKEN) return true;
+  if (!TOKEN) return false;
   const a = Buffer.from(bearer(req));
   const b = Buffer.from(TOKEN);
   return a.length === b.length && timingSafeEqual(a, b);
@@ -49,17 +49,25 @@ function json(res: http.ServerResponse, status: number, body: unknown) {
 }
 
 export function startHttp() {
+  if (!TOKEN) throw new Error("HTTP mode requires MCP_AUTH_TOKEN. Use stdio for credential-free local development.");
+  const publicUrl = envValue("SEO_MCP_PUBLIC_URL");
+  const hosts = new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`, `[::1]:${PORT}`]);
+  if (!["0.0.0.0", "::"].includes(HOST)) hosts.add(`${HOST.includes(":") && !HOST.startsWith("[") ? `[${HOST}]` : HOST}:${PORT}`);
+  const origins = new Set([...hosts].map((host) => `http://${host}`));
+  if (publicUrl) { const u = new URL(publicUrl); hosts.add(u.host); origins.add(u.origin); }
+  for (const host of (envValue("MCP_ALLOWED_HOSTS") ?? "").split(",").filter(Boolean)) hosts.add(host.trim().toLowerCase());
+  for (const origin of (envValue("MCP_ALLOWED_ORIGINS") ?? "").split(",").filter(Boolean)) origins.add(new URL(origin.trim()).origin);
   const hosted = loadHosted();
   // Optional OAuth layer (SEO_MCP_OAUTH=1) for clients that cannot send a static bearer token.
   const oauth = loadOAuth();
   // Optional weekly Search Console digest (SEO_MCP_DIGEST_SITES), so a drop reports itself.
   const digest = startDigestSchedule();
-  if (!TOKEN && HOST !== "127.0.0.1" && HOST !== "localhost" && HOST !== "::1") {
-    console.error("WARNING: MCP_AUTH_TOKEN is not set while binding to a non-loopback host. Anyone reaching this port can query your Google data.");
-  }
-
-  const httpServer = http.createServer(async (req, res) => {
-    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  const handle = async (req: http.IncomingMessage, res: http.ServerResponse) => {
+    const host = req.headers.host?.toLowerCase();
+    if (!host || !hosts.has(host)) { json(res, 403, { error: "invalid host" }); return; }
+    if (req.headers.origin && !origins.has(req.headers.origin)) { json(res, 403, { error: "invalid origin" }); return; }
+    if (!req.url?.startsWith("/") || req.url.startsWith("//")) { json(res, 400, { error: "invalid request target" }); return; }
+    const url = new URL(req.url, `http://${host}`);
 
     if (url.pathname === "/healthz") {
       // Liveness for proxies and deploy scripts; version and credential source only for callers that hold the token.
@@ -118,7 +126,7 @@ export function startHttp() {
     // Stateless: a fresh server + transport per request, so a crash in one
     // request never affects others and there is nothing to leak over days of uptime.
     const server = createServer(options);
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableDnsRebindingProtection: true, allowedHosts: [...hosts], allowedOrigins: [...origins] });
     res.on("close", () => {
       void transport.close();
       void server.close();
@@ -131,6 +139,12 @@ export function startHttp() {
       console.error("request failed:", err);
       if (!res.headersSent) json(res, 500, { error: "internal error" });
     }
+  };
+  const httpServer = http.createServer((req, res) => {
+    void handle(req, res).catch((err) => {
+      console.error("request failed:", err instanceof Error ? err.message : "unknown error");
+      if (!res.headersSent) json(res, 400, { error: "bad request" }); else res.destroy();
+    });
   });
 
   httpServer.keepAliveTimeout = 65_000;

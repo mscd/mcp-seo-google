@@ -12,7 +12,9 @@ test("encrypt/decrypt round-trips and rejects tampering", () => {
   assert.equal(decrypt(blob, key), "1//refresh-token");
   assert.notEqual(encrypt("1//refresh-token", key), blob, "fresh IV per call");
   const parts = blob.split(".");
-  parts[2] = parts[2].slice(0, -2) + "AA";
+  const tampered = Buffer.from(parts[2], "base64url");
+  tampered[0] ^= 1; // Always change the ciphertext; a random suffix could already be "AA".
+  parts[2] = tampered.toString("base64url");
   assert.throws(() => decrypt(parts.join("."), key));
   assert.throws(() => decrypt(blob, deriveKey("other")));
 });

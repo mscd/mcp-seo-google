@@ -12,6 +12,47 @@ $in = defined('SEO_MCP_TEST') ? [] : (json_decode(stream_get_contents(STDIN) ?: 
 function h_out($d) { echo json_encode($d, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES); exit(0); }
 function h_fail($m) { echo json_encode(['error' => $m]); exit(1); }
 
+/** Encode data for an HTML script element, including values stored by older versions. */
+function h_schema_json($value) {
+  return json_encode($value, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+}
+
+function h_schema_plugin_code() {
+  return <<<'PHP'
+<?php
+/**
+ * Plugin Name: SEO MCP Schema
+ * Description: Outputs JSON-LD stored in the _seo_mcp_schema post meta (managed by google-seo-mcp).
+ * Version: 1.1
+ */
+add_action('wp_head', function () {
+  if (!is_singular()) return;
+  $raw = get_post_meta(get_queried_object_id(), '_seo_mcp_schema', true);
+  if (!$raw) return;
+  $data = json_decode($raw, true);
+  if (!is_array($data)) return;
+  $json = wp_json_encode($data, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE);
+  if ($json === false) return;
+  echo "\n<script type=\"application/ld+json\" class=\"seo-mcp-schema\">" . $json . "</script>\n";
+}, 99);
+PHP;
+}
+
+function h_install_schema_plugin($plugin) {
+  $code = h_schema_plugin_code();
+  if (file_exists($plugin)) {
+    $old = file_get_contents($plugin);
+    if ($old === $code) return;
+    // Never overwrite a different plugin or a symlink supplied by the site owner.
+    if (is_link($plugin) || $old === false || strpos($old, 'Plugin Name: SEO MCP Schema') === false || strpos($old, 'managed by google-seo-mcp') === false) h_fail('refusing to replace an unrecognized schema plugin');
+  }
+  if (!is_dir(dirname($plugin))) mkdir(dirname($plugin), 0755, true);
+  $tmp = tempnam(dirname($plugin), '.seo-schema-');
+  if ($tmp === false || file_put_contents($tmp, $code) === false) h_fail('could not write schema plugin');
+  chmod($tmp, 0644);
+  if (!rename($tmp, $plugin)) { unlink($tmp); h_fail('could not replace schema plugin'); }
+}
+
 function h_yoast_rebuild($id, $type = 'post') {
   try {
     $r = YoastSEO()->classes->get(\Yoast\WP\SEO\Repositories\Indexable_Repository::class);
@@ -354,13 +395,9 @@ switch ($action) {
     $id = (int) ($in['id'] ?? 0);
     if (!$id || !get_post($id)) h_fail("post {$id} not found");
     $plugin = WPMU_PLUGIN_DIR . '/seo-mcp-schema.php';
-    if (!file_exists($plugin)) {
-      if (!is_dir(WPMU_PLUGIN_DIR)) mkdir(WPMU_PLUGIN_DIR, 0755, true);
-      $code = "<?php\n/**\n * Plugin Name: SEO MCP Schema\n * Description: Outputs JSON-LD stored in the _seo_mcp_schema post meta (managed by google-seo-mcp).\n * Version: 1.0\n */\nadd_action('wp_head', function () {\n  if (!is_singular()) return;\n  \$json = get_post_meta(get_queried_object_id(), '_seo_mcp_schema', true);\n  if (!\$json) return;\n  echo \"\\n<script type=\\\"application/ld+json\\\" class=\\\"seo-mcp-schema\\\">\" . \$json . \"</script>\\n\";\n}, 99);\n";
-      if (file_put_contents($plugin, $code) === false) h_fail('could not write mu-plugin ' . $plugin);
-    }
+    h_install_schema_plugin($plugin);
     if (empty($in['jsonld'])) { delete_post_meta($id, '_seo_mcp_schema'); $stored = null; }
-    else { $stored = json_encode($in['jsonld'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES); update_post_meta($id, '_seo_mcp_schema', wp_slash($stored)); }
+    else { $stored = h_schema_json($in['jsonld']); update_post_meta($id, '_seo_mcp_schema', wp_slash($stored)); }
     h_out(['id' => $id, 'url' => get_permalink($id), 'stored' => $stored ? json_decode($stored, true) : null, 'bytes' => $stored ? strlen($stored) : 0, 'muPlugin' => $plugin, 'purged' => h_purge($id)]);
   }
 

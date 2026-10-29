@@ -16,7 +16,9 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { OAuth2Client } from "google-auth-library";
+import { randomBytes } from "node:crypto";
+import { callbackHandler } from "./authCallback.js";
+import { OAuth2Client, CodeChallengeMethod } from "google-auth-library";
 import { DEFAULT_CREDENTIALS_PATH, SCOPES } from "./google.js";
 import { DEFAULT_GMAIL_CREDENTIALS_PATH, GMAIL_SCOPES } from "./gmail.js";
 
@@ -47,7 +49,9 @@ function loadClient(): { clientId: string; clientSecret: string } {
 function openBrowser(url: string) {
   const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
   try {
-    spawn(cmd, [url], { stdio: "ignore", detached: true, shell: process.platform === "win32" }).unref();
+    // The URL is printed above; missing desktop utilities must not abort auth.
+    if (process.platform === "win32") return;
+    spawn(cmd, [url], { stdio: "ignore", detached: true }).on("error", () => {}).unref();
   } catch {
     /* user can open the URL manually */
   }
@@ -56,29 +60,25 @@ function openBrowser(url: string) {
 async function main() {
   const { clientId, clientSecret } = loadClient();
   const oauth2 = new OAuth2Client(clientId, clientSecret, REDIRECT);
-  const url = oauth2.generateAuthUrl({ access_type: "offline", prompt: "consent", scope: GMAIL ? GMAIL_SCOPES : SCOPES });
+  const state = randomBytes(32).toString("base64url");
+  const { codeVerifier, codeChallenge } = await oauth2.generateCodeVerifierAsync();
+  const url = oauth2.generateAuthUrl({ access_type: "offline", prompt: "consent", scope: GMAIL ? GMAIL_SCOPES : SCOPES, state, code_challenge: codeChallenge, code_challenge_method: CodeChallengeMethod.S256 });
 
   const code = await new Promise<string>((resolve, reject) => {
-    const server = http.createServer((req, res) => {
-      const u = new URL(req.url ?? "/", REDIRECT);
-      if (u.pathname !== "/oauth2callback") {
-        res.writeHead(404).end();
-        return;
-      }
-      const err = u.searchParams.get("error");
-      const c = u.searchParams.get("code");
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(err ? `<h2>授权失败: ${err}</h2>` : "<h2>授权成功，可以关闭此页面。</h2>");
+    const server = http.createServer(callbackHandler(REDIRECT, state, (err, code) => {
+      clearTimeout(timer);
       server.close();
-      if (err || !c) reject(new Error(err ?? "no code")); else resolve(c);
-    });
+      if (err) reject(err); else resolve(code!);
+    }));
+    const timer = setTimeout(() => { server.closeAllConnections(); server.close(); reject(new Error("OAuth callback timed out after ten minutes")); }, 600_000);
+    server.once("error", (err) => { clearTimeout(timer); reject(err); });
     server.listen(PORT, "127.0.0.1", () => {
       console.log("\n请在浏览器中打开以下链接完成授权：\n\n" + url + "\n");
       openBrowser(url);
     });
   });
 
-  const { tokens } = await oauth2.getToken(code);
+  const { tokens } = await oauth2.getToken({ code, codeVerifier });
   if (!tokens.refresh_token) {
     throw new Error("No refresh_token returned. Remove the app from https://myaccount.google.com/permissions and run again.");
   }
